@@ -19,11 +19,36 @@ from models import VALID_CATEGORIES
 # Stemmer (no external dependencies)
 # =====================================================================
 
-_STOP_WORDS = frozenset({
-    "a", "an", "the", "and", "or", "for", "of", "in", "on", "to",
-    "by", "with", "from", "is", "are", "was", "were", "be", "been",
-    "has", "have", "had", "its", "it", "this", "that",
-})
+_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "for",
+        "of",
+        "in",
+        "on",
+        "to",
+        "by",
+        "with",
+        "from",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "has",
+        "have",
+        "had",
+        "its",
+        "it",
+        "this",
+        "that",
+    }
+)
 
 
 def _stem(word: str) -> str:
@@ -32,17 +57,17 @@ def _stem(word: str) -> str:
     if len(w) < 3:
         return w
     if w.endswith("ies") and len(w) > 4:
-        return w[:-3] + "y"      # "batteries" → "battery", "accessories" → "accessory"
+        return w[:-3] + "y"  # "batteries" → "battery", "accessories" → "accessory"
     if w.endswith("es") and len(w) > 4:
         pre = w[:-2]
         # -es is a proper suffix only after sibilants (ch, sh, x, ss, zz)
         if pre.endswith(("ch", "sh", "x", "ss", "zz")):
-            return pre           # "watches" → "watch", "presses" → "press", "boxes" → "box"
-        return w[:-1]            # "shoes" → "shoe", "houses" → "house", "laces" → "lace"
+            return pre  # "watches" → "watch", "presses" → "press", "boxes" → "box"
+        return w[:-1]  # "shoes" → "shoe", "houses" → "house", "laces" → "lace"
     if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
-        return w[:-1]            # "drills" → "drill", "lamps" → "lamp"
+        return w[:-1]  # "drills" → "drill", "lamps" → "lamp"
     if w.endswith("ing") and len(w) > 5:
-        return w[:-3]            # "lighting" → "light"
+        return w[:-3]  # "lighting" → "light"
     return w
 
 
@@ -56,15 +81,30 @@ def _tokenize(text: str) -> list[str]:
 # Tree Nodes
 # =====================================================================
 
+
 class TaxonomyNode:
     """A node in the taxonomy tree."""
+
     __slots__ = (
-        "name", "full_path", "taxonomy_id", "parent", "children",
-        "is_leaf", "depth", "leaf_tokens", "subtree_tokens",
+        "children",
+        "depth",
+        "full_path",
+        "is_leaf",
+        "leaf_tokens",
+        "name",
+        "parent",
+        "subtree_tokens",
+        "taxonomy_id",
     )
 
-    def __init__(self, name: str, full_path: str, taxonomy_id: int | None = None,
-                 parent: "TaxonomyNode | None" = None, depth: int = 0):
+    def __init__(
+        self,
+        name: str,
+        full_path: str,
+        taxonomy_id: int | None = None,
+        parent: "TaxonomyNode | None" = None,
+        depth: int = 0,
+    ):
         self.name = name
         self.full_path = full_path
         self.taxonomy_id = taxonomy_id
@@ -82,6 +122,7 @@ class TaxonomyNode:
 # =====================================================================
 # Taxonomy Tree
 # =====================================================================
+
 
 class TaxonomyTree:
     """Augmented n-ary tree over Google's Product Taxonomy.
@@ -106,7 +147,7 @@ class TaxonomyTree:
 
     def _build(self, path: Path) -> None:
         """Parse categories.txt and build tree + lookup indexes."""
-        with open(path, "r") as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -162,6 +203,7 @@ class TaxonomyTree:
 
     def _propagate_subtree_tokens(self) -> None:
         """Bottom-up propagation: each node's subtree_tokens = union of all descendant tokens."""
+
         def _propagate(node: TaxonomyNode) -> set[str]:
             tokens = set(node.leaf_tokens)
             for child in node.children.values():
@@ -241,7 +283,9 @@ class TaxonomyTree:
         return None
 
     def classify(
-        self, signals: list[str], top_n: int = 10,
+        self,
+        signals: list[str],
+        top_n: int = 10,
     ) -> tuple[str | None, list[str]]:
         """Classify product signals into the taxonomy.
 
@@ -306,7 +350,9 @@ class TaxonomyTree:
         return None, candidates
 
     def _score_subtree(
-        self, node: TaxonomyNode, query_tokens: set[str],
+        self,
+        node: TaxonomyNode,
+        query_tokens: set[str],
         leaf_scores: dict[str, float],
         token_weights: dict[str, float] | None = None,
     ) -> None:
@@ -323,7 +369,9 @@ class TaxonomyTree:
                 self._score_subtree(child, query_tokens, leaf_scores, token_weights)
 
     def _score_leaf(
-        self, node: TaxonomyNode, query_tokens: set[str],
+        self,
+        node: TaxonomyNode,
+        query_tokens: set[str],
         token_weights: dict[str, float] | None = None,
     ) -> float:
         """Score a leaf node against query tokens.
@@ -391,13 +439,15 @@ tree = TaxonomyTree(_TAXONOMY_FILE)
 # Convenience functions (delegates to singleton)
 # =====================================================================
 
+
 def resolve(raw: str) -> str | None:
     """Try to resolve a raw category string to an exact taxonomy path."""
     return tree.resolve(raw)
 
 
 def classify(
-    signals: list[str], top_n: int = 10,
+    signals: list[str],
+    top_n: int = 10,
 ) -> tuple[str | None, list[str]]:
     """Classify product signals into the taxonomy."""
     return tree.classify(signals, top_n=top_n)

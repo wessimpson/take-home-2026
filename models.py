@@ -1,11 +1,12 @@
 from pathlib import Path
+
 from pydantic import BaseModel, field_validator
 
 # Load categories once at module level
 CATEGORIES_FILE = Path(__file__).parent / "categories.txt"
 VALID_CATEGORIES = set()
 if CATEGORIES_FILE.exists():
-    with open(CATEGORIES_FILE, "r") as f:
+    with open(CATEGORIES_FILE) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
@@ -13,6 +14,7 @@ if CATEGORIES_FILE.exists():
                 if " - " in line:
                     line = line.split(" - ", 1)[1]
                 VALID_CATEGORIES.add(line)
+
 
 class Category(BaseModel):
     # A category from Google's Product Taxonomy
@@ -25,6 +27,7 @@ class Category(BaseModel):
         if v not in VALID_CATEGORIES:
             raise ValueError(f"Category '{v}' is not a valid category in categories.txt")
         return v
+
 
 class Price(BaseModel):
     price: float

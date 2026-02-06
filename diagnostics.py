@@ -3,15 +3,24 @@ Diagnostic: run parser + programmatic hydration only (no LLM).
 Reports what fields are filled vs missing for each HTML file.
 """
 
-import json
 from pathlib import Path
 
-from parser import parse_html
-from extractor import _hydrate_fields, _extract_colors_from_all_data
+from extractor import _hydrate_fields
 from models import Price, Variant
+from parser import parse_html
 
 DATA_DIR = Path(__file__).parent / "data"
-REQUIRED_FIELDS = ["name", "brand", "price", "description", "key_features", "image_urls", "category", "colors", "variants"]
+REQUIRED_FIELDS = [
+    "name",
+    "brand",
+    "price",
+    "description",
+    "key_features",
+    "image_urls",
+    "category",
+    "colors",
+    "variants",
+]
 OPTIONAL_FIELDS = ["video_url"]
 
 
@@ -45,7 +54,9 @@ def diagnose_file(filepath: Path) -> dict:
             report["filled"].append(field)
             # Summarize the value
             if isinstance(val, Price):
-                report["fields"][field] = f"{val.price} {val.currency}" + (f" (was {val.compare_at_price})" if val.compare_at_price else "")
+                report["fields"][field] = f"{val.price} {val.currency}" + (
+                    f" (was {val.compare_at_price})" if val.compare_at_price else ""
+                )
             elif isinstance(val, list) and val and isinstance(val[0], Variant):
                 report["fields"][field] = f"{len(val)} variants"
                 # Show first 3
@@ -58,7 +69,7 @@ def diagnose_file(filepath: Path) -> dict:
                     if len(val) <= 5:
                         report["fields"][field] = val
                     else:
-                        report["fields"][field] = f"{len(val)} items: {val[:3]} + {len(val)-3} more"
+                        report["fields"][field] = f"{len(val)} items: {val[:3]} + {len(val) - 3} more"
                 else:
                     report["fields"][field] = f"{len(val)} items"
             elif isinstance(val, str):
@@ -78,15 +89,17 @@ def main():
         report = diagnose_file(filepath)
         all_reports.append(report)
 
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         print(f"  {report['file']}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         # Parser stats
         p = report["parser"]
-        print(f"  Parser: {p['json_ld_blocks']} JSON-LD | {p['og_tags']} OG tags | "
-              f"{len(p['embedded_json_sources'])} embedded JSON | "
-              f"{p['image_urls_from_html']} imgs | {p['video_urls_from_html']} videos")
+        print(
+            f"  Parser: {p['json_ld_blocks']} JSON-LD | {p['og_tags']} OG tags | "
+            f"{len(p['embedded_json_sources'])} embedded JSON | "
+            f"{p['image_urls_from_html']} imgs | {p['video_urls_from_html']} videos"
+        )
         if p["embedded_json_sources"]:
             print(f"  Embedded sources: {p['embedded_json_sources']}")
 
@@ -105,14 +118,14 @@ def main():
         if report["missing"]:
             print(f"\n  MISSING ({len(report['missing'])}): {report['missing']}")
         else:
-            print(f"\n  All fields filled!")
+            print("\n  All fields filled!")
 
         print()
 
     # Summary table
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("SUMMARY: Field coverage across all files")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"{'Field':<20} ", end="")
     for r in all_reports:
         print(f"{r['file'][:12]:<14}", end="")

@@ -11,9 +11,9 @@ import logging
 import time
 from pathlib import Path
 
+from extractor import PRODUCT_FIELDS, ExtractionMetrics, extract_product
 from models import Product
 from parser import parse_html
-from extractor import extract_product, ExtractionMetrics, PRODUCT_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ async def process_all() -> tuple[list[Product], list[ExtractionMetrics], list[fl
     parse_times: list[float] = []
     failures = 0
 
-    for filepath, result in zip(html_files, results):
+    for filepath, result in zip(html_files, results, strict=True):
         if isinstance(result, Exception):
             logger.error(f"Failed to process {filepath.name}: {result}", exc_info=result)
             failures += 1
@@ -103,41 +103,47 @@ def print_report(
     n = len(all_metrics)
 
     # ── Reliability ──────────────────────────────────────────────────
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("EXTRACTION REPORT")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
-    print(f"\n── Reliability ──")
+    print("\n── Reliability ──")
     print(f"  Files attempted:  {total_files}")
     print(f"  Succeeded:        {n}")
     print(f"  Failed:           {failures}")
-    print(f"  Success rate:     {n/total_files*100:.0f}%" if total_files else "  N/A")
+    print(f"  Success rate:     {n / total_files * 100:.0f}%" if total_files else "  N/A")
 
     if not all_metrics:
         print("\n  No successful extractions to report on.")
         return
 
     # ── Parser vs LLM (cost lever) ──────────────────────────────────
-    print(f"\n── Parser vs LLM (free vs paid) ──")
+    print("\n── Parser vs LLM (free vs paid) ──")
     total_fields_possible = n * len(PRODUCT_FIELDS)
     total_from_parser = sum(len(m.fields_from_parser) for m in all_metrics)
     total_from_llm = sum(len(m.fields_from_llm) for m in all_metrics)
     total_missing = sum(len(m.fields_missing_after_all) for m in all_metrics)
 
-    print(f"  Fields filled by parser (free):  {total_from_parser}/{total_fields_possible} "
-          f"({total_from_parser/total_fields_possible*100:.0f}%)")
-    print(f"  Fields filled by LLM (paid):     {total_from_llm}/{total_fields_possible} "
-          f"({total_from_llm/total_fields_possible*100:.0f}%)")
-    print(f"  Fields still empty after all:     {total_missing}/{total_fields_possible} "
-          f"({total_missing/total_fields_possible*100:.0f}%)")
+    print(
+        f"  Fields filled by parser (free):  {total_from_parser}/{total_fields_possible} "
+        f"({total_from_parser / total_fields_possible * 100:.0f}%)"
+    )
+    print(
+        f"  Fields filled by LLM (paid):     {total_from_llm}/{total_fields_possible} "
+        f"({total_from_llm / total_fields_possible * 100:.0f}%)"
+    )
+    print(
+        f"  Fields still empty after all:     {total_missing}/{total_fields_possible} "
+        f"({total_missing / total_fields_possible * 100:.0f}%)"
+    )
 
     llm_skipped = sum(1 for m in all_metrics if m.llm_skipped)
     print(f"  Products needing zero LLM calls:  {llm_skipped}/{n}")
 
     # Per-field breakdown
-    print(f"\n  Per-field source breakdown:")
+    print("\n  Per-field source breakdown:")
     print(f"  {'Field':<20} {'Parser':>8} {'LLM':>8} {'Empty':>8}")
-    print(f"  {'-'*46}")
+    print(f"  {'-' * 46}")
     for field in PRODUCT_FIELDS:
         from_parser = sum(1 for m in all_metrics if field in m.fields_from_parser)
         from_llm = sum(1 for m in all_metrics if field in m.fields_from_llm)
@@ -145,16 +151,16 @@ def print_report(
         print(f"  {field:<20} {from_parser:>7}  {from_llm:>7}  {empty:>7}")
 
     # ── LLM Cost ────────────────────────────────────────────────────
-    print(f"\n── LLM Usage ──")
+    print("\n── LLM Usage ──")
     total_llm_calls = sum(m.llm_calls for m in all_metrics)
     print(f"  Total LLM calls:  {total_llm_calls} across {n} products")
-    print(f"  Avg calls/product: {total_llm_calls/n:.1f}")
+    print(f"  Avg calls/product: {total_llm_calls / n:.1f}")
     for m in all_metrics:
         label = "skipped" if m.llm_skipped else f"{m.llm_calls} call(s)"
         print(f"    {m.filename:<25} {label}")
 
     # ── Category Resolution ─────────────────────────────────────────
-    print(f"\n── Category Resolution ──")
+    print("\n── Category Resolution ──")
     resolutions: dict[str, int] = {}
     for m in all_metrics:
         resolutions[m.category_resolution] = resolutions.get(m.category_resolution, 0) + 1
@@ -172,31 +178,37 @@ def print_report(
         print(f"    {m.filename:<25} {m.category_resolution}")
 
     # ── Output Richness ─────────────────────────────────────────────
-    print(f"\n── Output Richness ──")
+    print("\n── Output Richness ──")
     print(f"  {'File':<25} {'Variants':>9} {'Images':>8} {'Features':>9} {'Colors':>8} {'Video':>7} {'Sale':>6}")
-    print(f"  {'-'*73}")
+    print(f"  {'-' * 73}")
     for m in all_metrics:
-        print(f"  {m.filename:<25} {m.num_variants:>9} {m.num_images:>8} "
-              f"{m.num_features:>9} {m.num_colors:>8} "
-              f"{'yes' if m.has_video else '-':>7} "
-              f"{'yes' if m.has_sale_price else '-':>6}")
+        print(
+            f"  {m.filename:<25} {m.num_variants:>9} {m.num_images:>8} "
+            f"{m.num_features:>9} {m.num_colors:>8} "
+            f"{'yes' if m.has_video else '-':>7} "
+            f"{'yes' if m.has_sale_price else '-':>6}"
+        )
     # Totals
-    print(f"  {'-'*73}")
-    print(f"  {'TOTAL':<25} {sum(m.num_variants for m in all_metrics):>9} "
-          f"{sum(m.num_images for m in all_metrics):>8} "
-          f"{sum(m.num_features for m in all_metrics):>9} "
-          f"{sum(m.num_colors for m in all_metrics):>8} "
-          f"{sum(1 for m in all_metrics if m.has_video):>7} "
-          f"{sum(1 for m in all_metrics if m.has_sale_price):>6}")
+    print(f"  {'-' * 73}")
+    print(
+        f"  {'TOTAL':<25} {sum(m.num_variants for m in all_metrics):>9} "
+        f"{sum(m.num_images for m in all_metrics):>8} "
+        f"{sum(m.num_features for m in all_metrics):>9} "
+        f"{sum(m.num_colors for m in all_metrics):>8} "
+        f"{sum(1 for m in all_metrics if m.has_video):>7} "
+        f"{sum(1 for m in all_metrics if m.has_sale_price):>6}"
+    )
 
     # ── Timing ──────────────────────────────────────────────────────
-    print(f"\n── Timing ──")
+    print("\n── Timing ──")
     print(f"  Wall clock (total):  {wall_clock:.2f}s")
     print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'Total':>8}")
-    print(f"  {'-'*69}")
-    for m, pt in zip(all_metrics, parse_times):
-        print(f"  {m.filename:<25} {pt:>7.3f}s {m.hydrate_time:>8.3f}s "
-              f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s {m.total_time:>7.3f}s")
+    print(f"  {'-' * 69}")
+    for m, pt in zip(all_metrics, parse_times, strict=True):
+        print(
+            f"  {m.filename:<25} {pt:>7.3f}s {m.hydrate_time:>8.3f}s "
+            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s {m.total_time:>7.3f}s"
+        )
 
     total_parse = sum(parse_times)
     total_hydrate = sum(m.hydrate_time for m in all_metrics)
@@ -204,9 +216,11 @@ def print_report(
     total_validate = sum(m.validate_time for m in all_metrics)
     sum_total = sum(m.total_time for m in all_metrics)
 
-    print(f"  {'-'*69}")
-    print(f"  {'SUM':<25} {total_parse:>7.3f}s {total_hydrate:>8.3f}s "
-          f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s {sum_total:>7.3f}s")
+    print(f"  {'-' * 69}")
+    print(
+        f"  {'SUM':<25} {total_parse:>7.3f}s {total_hydrate:>8.3f}s "
+        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s {sum_total:>7.3f}s"
+    )
 
     if sum_total > 0:
         pct_free = (total_parse + total_hydrate) / sum_total * 100
@@ -215,17 +229,17 @@ def print_report(
         print(f"  Time in LLM stages (fill+retry):     {pct_llm:.1f}%")
 
     # ── Scale Projections ───────────────────────────────────────────
-    print(f"\n── Scale Projections ──")
+    print("\n── Scale Projections ──")
     avg_llm_calls = total_llm_calls / n
     avg_time = wall_clock / n  # wall clock per product (with parallelism)
-    seq_time = sum_total / n   # sequential time per product
+    seq_time = sum_total / n  # sequential time per product
     print(f"  Avg LLM calls per product:   {avg_llm_calls:.1f}")
     print(f"  Avg time per product (seq):  {seq_time:.2f}s")
     print(f"  Avg time per product (wall): {avg_time:.2f}s")
     print(f"  Est. 1K products (wall):     {avg_time * 1000:.0f}s ({avg_time * 1000 / 60:.1f}min)")
     print(f"  Est. 1K products (seq):      {seq_time * 1000:.0f}s ({seq_time * 1000 / 60:.1f}min)")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
 
 
 async def main() -> None:
@@ -234,9 +248,9 @@ async def main() -> None:
     wall_clock = time.monotonic() - t_wall_start
 
     # Print per-product summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Extracted {len(products)} products:")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     for p in products:
         print(f"\n  {p.name}")
