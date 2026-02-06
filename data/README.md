@@ -6,3 +6,5 @@ URLs:
 - https://www.article.com/product/25289/pilar-floor-lamp-white-terrazzo
 
 All data in the HTML files was obtained by CURLing the above URLs.
+
+See `validation-data/` for additional product pages used to test extraction generalizability.
