@@ -9,6 +9,9 @@ if CATEGORIES_FILE.exists():
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
+                # Parse "ID - Category > Path" format (strip numeric ID prefix)
+                if " - " in line:
+                    line = line.split(" - ", 1)[1]
                 VALID_CATEGORIES.add(line)
 
 class Category(BaseModel):
