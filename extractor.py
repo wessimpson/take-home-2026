@@ -7,6 +7,7 @@ Three stages:
   C) Validate with Pydantic, retry category with taxonomy subset on failure
 """
 
+import contextlib
 import html as html_lib
 import logging
 import re
@@ -25,15 +26,27 @@ logger = logging.getLogger(__name__)
 
 # Keys that signal "this dict is about a product" — generic e-commerce vocabulary only
 PRODUCT_SIGNAL_KEYS = {
-    "name", "title",
-    "price", "prices", "offers",
+    "name",
+    "title",
+    "price",
+    "prices",
+    "offers",
     "description",
-    "brand", "brandName",
+    "brand",
+    "brandName",
     "sku",
-    "image", "images", "media",
-    "variants", "items", "skus", "sizes", "hasVariant",
+    "image",
+    "images",
+    "media",
+    "variants",
+    "items",
+    "skus",
+    "sizes",
+    "hasVariant",
     "google_merchant_category",
-    "color", "colors", "questions",
+    "color",
+    "colors",
+    "questions",
 }
 
 # Model to use for LLM gap-filling
@@ -42,13 +55,24 @@ LLM_MODEL = "google/gemini-2.0-flash-lite-001"
 
 # ===== Metrics =====
 
-PRODUCT_FIELDS = ["name", "brand", "price", "description", "key_features",
-                  "image_urls", "video_url", "category", "colors", "variants"]
+PRODUCT_FIELDS = [
+    "name",
+    "brand",
+    "price",
+    "description",
+    "key_features",
+    "image_urls",
+    "video_url",
+    "category",
+    "colors",
+    "variants",
+]
 
 
 @dataclass
 class ExtractionMetrics:
     """Per-file metrics collected during extraction."""
+
     filename: str = ""
     # Stage timing (seconds)
     hydrate_time: float = 0.0
@@ -81,6 +105,7 @@ class ExtractionMetrics:
 
 # ===== LLM Response Schema =====
 
+
 class LLMGapFill(BaseModel):
     category: str | None = None
     key_features: list[str] | None = None
@@ -91,6 +116,7 @@ class LLMGapFill(BaseModel):
 
 
 # ===== Main Entry Point =====
+
 
 async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, ExtractionMetrics]:
     """Full extraction pipeline: hydrate -> LLM fill -> validate. Returns product and metrics."""
@@ -118,9 +144,8 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
     # Record what LLM added
     for f in PRODUCT_FIELDS:
         val = fields.get(f)
-        if val is not None and val != "" and val != []:
-            if f not in metrics.fields_from_parser:
-                metrics.fields_from_llm.append(f)
+        if val is not None and val != "" and val != [] and f not in metrics.fields_from_parser:
+            metrics.fields_from_llm.append(f)
 
     # Stage C: Validate with Pydantic, retry category if needed
     t0 = time.monotonic()
@@ -170,10 +195,14 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
 # Semantic key patterns for recursive extraction
 _NAME_KEY_RE = re.compile(r"(?i)(^name$|^title$|productname|producttitle|fulltitle)")
 _DESC_KEY_RE = re.compile(r"(?i)(description|desc$|summary|overview|excerpt)")
-_FEATURE_KEY_RE = re.compile(r"(?i)(feature|benefit|highlight|specification|spec$|bullet|^note)")
+_FEATURE_KEY_RE = re.compile(
+    r"(?i)(feature|benefit|highlight|specification|specs?$|bullet|bullet_point|^note|selling_point|usp)"
+)
 _COLOR_KEY_RE = re.compile(r"(?i)(color|colour|shade|swatch|hue|^finish$)")
 _COLOR_NOISE_RE = re.compile(r"^(#[0-9a-fA-F]{3,8}|[A-Z]{2}\d{4}-\d{3}|rgba?\(|hsla?\()$")
-_PRICE_KEY_RE = re.compile(r"(?i)^(price|amount|cost|currentPrice|salePrice)$")
+_PRICE_KEY_RE = re.compile(
+    r"(?i)^(price|amount|cost|currentPrice|salePrice|regularPrice|unitPrice|productPrice|basePrice|variantPrice)$"
+)
 _CURRENCY_KEY_RE = re.compile(r"(?i)^(currency|priceCurrency|currencyCode)$")
 _COMPARE_PRICE_KEY_RE = re.compile(r"(?i)(compare|original|msrp|was|fullPrice|retail|initial|before|listPrice)")
 _SKIP_IMAGE_RE = re.compile(r"(?i)(favicon|logo|pixel|tracking|analytics|1x1|spacer|icon\b|\.svg)")
@@ -186,9 +215,26 @@ _VARIANT_SIZE_KEYS = re.compile(r"(?i)^(size|label|dimension)$")
 _VARIANT_COLOR_KEYS = re.compile(r"(?i)^(color|colour)$")
 _VARIANT_AVAIL_KEYS = re.compile(r"(?i)^(status|available|availability|stock|instock)$")
 _VARIANT_SIGNAL_KEYS = {
-    "size", "sku", "ean", "upc", "gtin", "barcode",
-    "label", "stock", "availability", "available",
-    "price", "amount", "color",
+    "size",
+    "sku",
+    "ean",
+    "upc",
+    "gtin",
+    "barcode",
+    "label",
+    "stock",
+    "availability",
+    "available",
+    "price",
+    "amount",
+    "color",
+    "colour",
+    "title",
+    "name",
+    "option",
+    "variant",
+    "option1",
+    "option2",
 }
 
 
@@ -267,7 +313,7 @@ def _collect_video_urls_recursive(
 
 def _extract_price_recursive(data: Any, depth: int = 0) -> Price | None:
     """Walk nested data to find and construct a Price from any price-like dict."""
-    if depth > 6:
+    if depth > 10:
         return None
     if isinstance(data, dict):
         price_val = None
@@ -275,8 +321,12 @@ def _extract_price_recursive(data: Any, depth: int = 0) -> Price | None:
         compare_val = None
 
         for k, v in data.items():
-            if _PRICE_KEY_RE.match(k) and isinstance(v, (int, float)):
-                price_val = float(v)
+            if _PRICE_KEY_RE.match(k):
+                if isinstance(v, (int, float)):
+                    price_val = float(v)
+                elif isinstance(v, str):
+                    with contextlib.suppress(ValueError):
+                        price_val = float(v.replace(",", ""))
             elif _CURRENCY_KEY_RE.match(k) and isinstance(v, str):
                 currency = v
             elif _COMPARE_PRICE_KEY_RE.search(k) and isinstance(v, (int, float)):
@@ -327,7 +377,7 @@ def _looks_like_variant_array(arr: list) -> bool:
     for item in sample:
         if not isinstance(item, dict):
             return False
-        signal_count = len(_VARIANT_SIGNAL_KEYS & {k.lower() for k in item.keys()})
+        signal_count = len(_VARIANT_SIGNAL_KEYS & {k.lower() for k in item})
         if signal_count < 2:
             return False
     return True
@@ -357,9 +407,7 @@ def _is_color_name(val: str) -> bool:
     if _COLOR_NOISE_RE.match(val):
         return False
     # Skip purely numeric or very short values (likely codes)
-    if val.isdigit() or len(val) < 2:
-        return False
-    return True
+    return not (val.isdigit() or len(val) < 2)
 
 
 def _clean_html(text: str) -> str:
@@ -373,12 +421,13 @@ def _clean_html(text: str) -> str:
 # Stage A: Programmatic Hydration
 # =====================================================================
 
+
 def _hydrate_fields(parsed: ParsedPage) -> dict:
     """Walk all data sources in priority order to fill Product fields."""
     fields: dict[str, Any] = {}
 
     # 1. Embedded JSON (richest source for most pages)
-    for source_name, data in parsed.embedded_json.items():
+    for _source_name, data in parsed.embedded_json.items():
         product_obj = _find_product_object(data)
         if product_obj:
             _extract_fields_from_object(product_obj, fields)
@@ -420,6 +469,7 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
 
 # ----- Product Object Finder -----
 
+
 def _find_product_object(data: Any, depth: int = 0) -> dict | None:
     """Recursively find the most product-like dict in an arbitrary JSON structure."""
     if depth > 10:
@@ -455,6 +505,7 @@ def _find_product_object(data: Any, depth: int = 0) -> dict | None:
 
 
 # ----- Field Extractors from Embedded JSON -----
+
 
 def _extract_fields_from_object(obj: dict, fields: dict) -> None:
     """Extract Product fields from a product-like embedded JSON object."""
@@ -515,6 +566,8 @@ def _extract_price_field(obj: dict, fields: dict) -> None:
 
     # JSON-LD offers pattern (schema.org standard)
     offers = obj.get("offers")
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
     if isinstance(offers, dict) and "price" in offers:
         fields["price"] = Price(
             price=float(offers["price"]),
@@ -548,7 +601,7 @@ def _extract_description(obj: dict, fields: dict) -> None:
 
 
 def _extract_features(obj: dict, fields: dict) -> None:
-    if "key_features" in fields and fields["key_features"]:
+    if fields.get("key_features"):
         return
     features: list[str] = []
 
@@ -596,7 +649,7 @@ def _extract_features(obj: dict, fields: dict) -> None:
 
 
 def _extract_images_from_obj(obj: dict, fields: dict) -> None:
-    if "image_urls" in fields and fields["image_urls"]:
+    if fields.get("image_urls"):
         return
     urls: list[str] = []
 
@@ -638,7 +691,7 @@ def _extract_video_from_obj(obj: dict, fields: dict) -> None:
 
 
 def _extract_colors(obj: dict, fields: dict) -> None:
-    if "colors" in fields and fields["colors"]:
+    if fields.get("colors"):
         return
     colors: list[str] = []
 
@@ -727,7 +780,7 @@ def _find_key_recursive(data: Any, key: str, depth: int = 0) -> Any:
 
 
 def _extract_variants(obj: dict, fields: dict) -> None:
-    if "variants" in fields and fields["variants"]:
+    if fields.get("variants"):
         return
 
     # Generic: questions + skus cross-reference (common quiz/dimension pattern)
@@ -761,12 +814,14 @@ def _extract_variants(obj: dict, fields: dict) -> None:
             elif isinstance(stock, dict):
                 total = sum(v for v in stock.values() if isinstance(v, (int, float)))
                 available = total > 0
-            variants.append(Variant(
-                attributes=attrs,
-                sku=str(sku) if sku else None,
-                gtin=str(ean) if ean else None,
-                available=available,
-            ))
+            variants.append(
+                Variant(
+                    attributes=attrs,
+                    sku=str(sku) if sku else None,
+                    gtin=str(ean) if ean else None,
+                    available=available,
+                )
+            )
         if variants:
             fields["variants"] = variants
             return
@@ -828,12 +883,14 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
                 attrs["size"] = str(name)
 
         if attrs or sku:
-            variants.append(Variant(
-                attributes=attrs,
-                sku=sku,
-                gtin=gtin,
-                available=available,
-            ))
+            variants.append(
+                Variant(
+                    attributes=attrs,
+                    sku=sku,
+                    gtin=gtin,
+                    available=available,
+                )
+            )
 
     return variants
 
@@ -879,11 +936,13 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
             status = str(availability.get("status", "")).upper()
             available = status not in ("OUT_OF_STOCK", "UNAVAILABLE")
 
-        variants.append(Variant(
-            attributes=attrs,
-            sku=sku_id,
-            available=available,
-        ))
+        variants.append(
+            Variant(
+                attributes=attrs,
+                sku=sku_id,
+                available=available,
+            )
+        )
 
     return variants
 
@@ -903,6 +962,7 @@ def _extract_category_hint(obj: dict, fields: dict) -> None:
 
 
 # ----- JSON-LD Field Extractor -----
+
 
 def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
     """Extract Product fields from a JSON-LD block."""
@@ -930,6 +990,8 @@ def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
     # Price from offers
     if "price" not in fields:
         offers = ld.get("offers")
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
         if isinstance(offers, dict) and "price" in offers:
             fields["price"] = Price(
                 price=float(offers["price"]),
@@ -989,22 +1051,27 @@ def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
                     continue
                 v_price = None
                 v_offers = v.get("offers")
+                if isinstance(v_offers, list) and v_offers:
+                    v_offers = v_offers[0]
                 if isinstance(v_offers, dict) and "price" in v_offers:
                     v_price = Price(
                         price=float(v_offers["price"]),
                         currency=v_offers.get("priceCurrency", "USD"),
                     )
-                variants.append(Variant(
-                    attributes=attrs,
-                    sku=v.get("mpn"),
-                    gtin=v.get("gtin"),
-                    price=v_price,
-                ))
+                variants.append(
+                    Variant(
+                        attributes=attrs,
+                        sku=v.get("mpn"),
+                        gtin=v.get("gtin"),
+                        price=v_price,
+                    )
+                )
             if variants:
                 fields["variants"] = variants
 
 
 # ----- OG Tag Extractor -----
+
 
 def _extract_fields_from_og(og: dict, fields: dict) -> None:
     """Extract Product fields from Open Graph meta tags."""
@@ -1019,8 +1086,21 @@ def _extract_fields_from_og(og: dict, fields: dict) -> None:
     if "brand" not in fields and og.get("site_name"):
         fields["brand"] = og["site_name"]
 
+    # Price from og:price:amount or product:price:amount meta tags
+    if "price" not in fields:
+        price_str = og.get("price:amount")
+        if price_str:
+            try:
+                price_val = float(price_str)
+                currency = og.get("price:currency", "USD")
+                if price_val > 0:
+                    fields["price"] = Price(price=price_val, currency=currency)
+            except (ValueError, TypeError):
+                pass
+
 
 # ----- Body Text Price Fallback -----
+
 
 def _extract_price_from_text(text: str, fields: dict) -> None:
     """Extract price from visible body text via regex (fallback when not in structured data)."""
@@ -1033,6 +1113,7 @@ def _extract_price_from_text(text: str, fields: dict) -> None:
 # =====================================================================
 # Stage B: LLM Gap-Fill
 # =====================================================================
+
 
 async def _llm_fill_gaps(fields: dict, parsed: ParsedPage) -> tuple[dict, int, bool]:
     """Call LLM only for fields still missing after programmatic hydration.
@@ -1126,8 +1207,7 @@ def _build_llm_context(fields: dict, parsed: ParsedPage, fill_fields: list[str])
 async def _call_llm_for_gaps(context: str, fill_fields: list[str], fields: dict, parsed: ParsedPage) -> LLMGapFill:
     """Call LLM to fill missing product fields."""
     system = (
-        "You are a product data extraction assistant. "
-        "Extract the requested fields from the product context provided. "
+        "You are a product data extraction assistant. Extract the requested fields from the product context provided. "
     )
 
     # If category is needed, use taxonomy tree to narrow candidates
@@ -1149,15 +1229,11 @@ async def _call_llm_for_gaps(context: str, fill_fields: list[str], fields: dict,
             "Never pick a broad top-level category like 'Hardware' or 'Home & Garden' "
             "when a more specific subcategory exists in the list."
         )
-        category_block = f"\n\nValid categories (pick the MOST SPECIFIC one, copy it EXACTLY):\n" + "\n".join(subset)
+        category_block = "\n\nValid categories (pick the MOST SPECIFIC one, copy it EXACTLY):\n" + "\n".join(subset)
     else:
         category_block = ""
 
-    user = (
-        f"Fill these missing fields: {', '.join(fill_fields)}\n\n"
-        f"{context}"
-        f"{category_block}"
-    )
+    user = f"Fill these missing fields: {', '.join(fill_fields)}\n\n{context}{category_block}"
 
     result = await ai.responses(
         model=LLM_MODEL,
@@ -1173,6 +1249,7 @@ async def _call_llm_for_gaps(context: str, fill_fields: list[str], fields: dict,
 # =====================================================================
 # Stage C: Validation + Category Retry
 # =====================================================================
+
 
 async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, bool, bool, bool, bool]:
     """Validate fields into a Product, trying fuzzy match before LLM retry.
@@ -1222,10 +1299,7 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
 
     # Ensure variants are dicts
     if "variants" in fields:
-        fields["variants"] = [
-            v.model_dump() if isinstance(v, Variant) else v
-            for v in fields["variants"]
-        ]
+        fields["variants"] = [v.model_dump() if isinstance(v, Variant) else v for v in fields["variants"]]
 
     # Save and remove internal hint fields before validation
     saved_hints = fields.pop("_category_hints", [])
@@ -1237,7 +1311,7 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
         # Check if it's a category validation error
         cat_errors = [err for err in e.errors() if "category" in str(err.get("loc", []))]
         if cat_errors:
-            logger.info(f"  Category validation failed, retrying with taxonomy subset...")
+            logger.info("  Category validation failed, retrying with taxonomy subset...")
             # Restore hints so taxonomy signals can use them during retry
             fields["_category_hints"] = saved_hints
             new_cat = await _retry_category(fields, parsed)
