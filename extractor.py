@@ -23,17 +23,17 @@ from parser import ParsedPage
 
 logger = logging.getLogger(__name__)
 
-# Keys that signal "this dict is about a product"
+# Keys that signal "this dict is about a product" — generic e-commerce vocabulary only
 PRODUCT_SIGNAL_KEYS = {
-    "name", "title", "productName", "fullTitle",
-    "price", "prices", "priceAsNumber", "offers",
-    "description", "descriptionHtml", "productDescription",
+    "name", "title",
+    "price", "prices", "offers",
+    "description",
     "brand", "brandName",
-    "sku", "productSku",
-    "image", "images", "media", "mediaObjects", "contentImages", "productImages",
+    "sku",
+    "image", "images", "media",
     "variants", "items", "skus", "sizes", "hasVariant",
-    "google_merchant_category", "productInfo", "productDetails",
-    "color", "colorDescription", "colors", "questions",
+    "google_merchant_category",
+    "color", "colors", "questions",
 }
 
 # Deeper keyword-to-prefix mapping for taxonomy narrowing.
@@ -256,6 +256,212 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
 
 
 # =====================================================================
+# Generic Utility Functions
+# =====================================================================
+
+# Semantic key patterns for recursive extraction
+_NAME_KEY_RE = re.compile(r"(?i)(^name$|^title$|productname|producttitle|fulltitle)")
+_DESC_KEY_RE = re.compile(r"(?i)(description|desc$|summary|overview|excerpt)")
+_FEATURE_KEY_RE = re.compile(r"(?i)(feature|benefit|highlight|specification|spec$|bullet|^note)")
+_COLOR_KEY_RE = re.compile(r"(?i)(color|colour|shade|swatch|hue|^finish$)")
+_COLOR_NOISE_RE = re.compile(r"^(#[0-9a-fA-F]{3,8}|[A-Z]{2}\d{4}-\d{3}|rgba?\(|hsla?\()$")
+_PRICE_KEY_RE = re.compile(r"(?i)^(price|amount|cost|currentPrice|salePrice)$")
+_CURRENCY_KEY_RE = re.compile(r"(?i)^(currency|priceCurrency|currencyCode)$")
+_COMPARE_PRICE_KEY_RE = re.compile(r"(?i)(compare|original|msrp|was|fullPrice|retail|initial|before|listPrice)")
+_SKIP_IMAGE_RE = re.compile(r"(?i)(favicon|logo|pixel|tracking|analytics|1x1|spacer|icon\b|\.svg)")
+_VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:mp4|webm|m3u8)", re.IGNORECASE)
+
+# Variant detection
+_VARIANT_SKU_KEYS = re.compile(r"(?i)^(sku|id|item|code|mpn)$")
+_VARIANT_GTIN_KEYS = re.compile(r"(?i)^(gtin|ean|upc|barcode|isbn)$")
+_VARIANT_SIZE_KEYS = re.compile(r"(?i)^(size|label|dimension)$")
+_VARIANT_COLOR_KEYS = re.compile(r"(?i)^(color|colour)$")
+_VARIANT_AVAIL_KEYS = re.compile(r"(?i)^(status|available|availability|stock|instock)$")
+_VARIANT_SIGNAL_KEYS = {
+    "size", "sku", "ean", "upc", "gtin", "barcode",
+    "label", "stock", "availability", "available",
+    "price", "amount", "color",
+}
+
+
+def _find_values_by_key_pattern(
+    data: Any,
+    key_patterns: list[re.Pattern],
+    depth: int = 0,
+    max_depth: int = 8,
+) -> list[Any]:
+    """Find all values in a nested structure whose keys match any of the given patterns."""
+    if depth > max_depth:
+        return []
+    results = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if any(p.search(k) for p in key_patterns):
+                results.append(v)
+            results.extend(_find_values_by_key_pattern(v, key_patterns, depth + 1, max_depth))
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_find_values_by_key_pattern(item, key_patterns, depth + 1, max_depth))
+    return results
+
+
+def _collect_image_urls_recursive(
+    data: Any,
+    depth: int = 0,
+    max_depth: int = 10,
+) -> list[str]:
+    """Recursively collect all string values that look like image URLs."""
+    if depth > max_depth:
+        return []
+    urls = []
+    if isinstance(data, str):
+        if _looks_like_image_url_string(data):
+            urls.append(data)
+    elif isinstance(data, dict):
+        for v in data.values():
+            urls.extend(_collect_image_urls_recursive(v, depth + 1, max_depth))
+    elif isinstance(data, list):
+        for item in data:
+            urls.extend(_collect_image_urls_recursive(item, depth + 1, max_depth))
+    return urls
+
+
+def _looks_like_image_url_string(s: str) -> bool:
+    """Check if a string looks like a product image URL."""
+    s = s.strip()
+    if not s.startswith(("http://", "https://", "//")):
+        return False
+    if _SKIP_IMAGE_RE.search(s):
+        return False
+    return bool(re.search(r"\.(jpg|jpeg|png|webp|gif|avif)", s, re.IGNORECASE))
+
+
+def _collect_video_urls_recursive(
+    data: Any,
+    depth: int = 0,
+    max_depth: int = 10,
+) -> list[str]:
+    """Recursively collect all string values that look like video URLs."""
+    if depth > max_depth:
+        return []
+    urls = []
+    if isinstance(data, str):
+        if _VIDEO_URL_RE.search(data):
+            urls.append(data)
+    elif isinstance(data, dict):
+        for v in data.values():
+            urls.extend(_collect_video_urls_recursive(v, depth + 1, max_depth))
+    elif isinstance(data, list):
+        for item in data:
+            urls.extend(_collect_video_urls_recursive(item, depth + 1, max_depth))
+    return urls
+
+
+def _extract_price_recursive(data: Any, depth: int = 0) -> Price | None:
+    """Walk nested data to find and construct a Price from any price-like dict."""
+    if depth > 6:
+        return None
+    if isinstance(data, dict):
+        price_val = None
+        currency = "USD"
+        compare_val = None
+
+        for k, v in data.items():
+            if _PRICE_KEY_RE.match(k) and isinstance(v, (int, float)):
+                price_val = float(v)
+            elif _CURRENCY_KEY_RE.match(k) and isinstance(v, str):
+                currency = v
+            elif _COMPARE_PRICE_KEY_RE.search(k) and isinstance(v, (int, float)):
+                compare_val = float(v)
+
+        if price_val is not None and price_val > 0:
+            # Compare-at must be higher than sale price to make sense as a discount
+            if compare_val and (compare_val == price_val or compare_val < price_val):
+                compare_val = None
+            return Price(price=price_val, currency=currency, compare_at_price=compare_val)
+
+        # Recurse into children
+        for v in data.values():
+            result = _extract_price_recursive(v, depth + 1)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = _extract_price_recursive(item, depth + 1)
+            if result:
+                return result
+    return None
+
+
+def _find_variant_arrays(data: Any, depth: int = 0, max_depth: int = 8) -> list[list[dict]]:
+    """Find arrays of dicts that look like variant/SKU lists."""
+    if depth > max_depth:
+        return []
+    results = []
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list) and len(v) >= 2 and _looks_like_variant_array(v):
+                results.append(v)
+            results.extend(_find_variant_arrays(v, depth + 1, max_depth))
+    elif isinstance(data, list):
+        if len(data) >= 2 and _looks_like_variant_array(data):
+            results.append(data)
+        for item in data:
+            results.extend(_find_variant_arrays(item, depth + 1, max_depth))
+    return results
+
+
+def _looks_like_variant_array(arr: list) -> bool:
+    """Check if a list of dicts looks like a variant/SKU array."""
+    if not arr or not isinstance(arr[0], dict):
+        return False
+    sample = arr[:3]
+    for item in sample:
+        if not isinstance(item, dict):
+            return False
+        signal_count = len(_VARIANT_SIGNAL_KEYS & {k.lower() for k in item.keys()})
+        if signal_count < 2:
+            return False
+    return True
+
+
+def _normalize_and_dedup_urls(urls: list[str]) -> list[str]:
+    """Normalize URLs and remove duplicates while preserving order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        url = url.strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if url and url not in seen and url.startswith("http"):
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def _is_color_name(val: str) -> bool:
+    """Check if a string looks like a color name (not a hex code, URL, or SKU)."""
+    val = val.strip()
+    if not val or len(val) > 80:
+        return False
+    if val.startswith(("http", "#", "rgba", "hsla")):
+        return False
+    if _COLOR_NOISE_RE.match(val):
+        return False
+    # Skip purely numeric or very short values (likely codes)
+    if val.isdigit() or len(val) < 2:
+        return False
+    return True
+
+
+def _clean_html(text: str) -> str:
+    """Strip HTML tags and normalize whitespace."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# =====================================================================
 # Stage A: Programmatic Hydration
 # =====================================================================
 
@@ -280,7 +486,7 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
     if "price" not in fields:
         _extract_price_from_text(parsed.body_text, fields)
 
-    # 5. Look for colors in wider data structures (colorwayImages etc.)
+    # 5. Look for colors across all embedded JSON data
     _extract_colors_from_all_data(parsed.embedded_json, fields)
 
     # 6. Collected image/video URLs from parser as final fallback
@@ -358,24 +564,17 @@ def _extract_fields_from_object(obj: dict, fields: dict) -> None:
 def _extract_name(obj: dict, fields: dict) -> None:
     if "name" in fields:
         return
-    name = (
-        obj.get("name")
-        or obj.get("title")
-        or obj.get("productName")
-        or obj.get("fullTitle")
-    )
-    # Check nested productInfo
-    if not name:
-        pi = obj.get("productInfo")
-        if isinstance(pi, dict):
-            name = pi.get("fullTitle") or pi.get("title")
-    # Check nested content
-    if not name:
-        content = obj.get("content")
-        if isinstance(content, dict):
-            name = content.get("productName")
+    # Try common top-level keys first
+    name = obj.get("name") or obj.get("title")
     if name and isinstance(name, str):
         fields["name"] = html_lib.unescape(name.strip())
+        return
+    # Recursive search for any key matching product name patterns
+    candidates = _find_values_by_key_pattern(obj, [_NAME_KEY_RE])
+    for c in candidates:
+        if isinstance(c, str) and len(c.strip()) > 5:
+            fields["name"] = html_lib.unescape(c.strip())
+            return
 
 
 def _extract_brand(obj: dict, fields: dict) -> None:
@@ -386,6 +585,17 @@ def _extract_brand(obj: dict, fields: dict) -> None:
         brand = brand.get("name")
     if isinstance(brand, list):
         brand = brand[0] if brand else None
+    if not brand or not isinstance(brand, str):
+        # Recursive fallback for keys matching "brand" or "brandName"
+        brand_pattern = re.compile(r"(?i)^brand(Name)?$")
+        candidates = _find_values_by_key_pattern(obj, [brand_pattern])
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                brand = c.strip()
+                break
+            elif isinstance(c, dict) and c.get("name"):
+                brand = c["name"]
+                break
     if brand and isinstance(brand, str):
         fields["brand"] = brand.strip()
 
@@ -394,109 +604,38 @@ def _extract_price_field(obj: dict, fields: dict) -> None:
     if "price" in fields:
         return
 
-    # Pattern: priceAsNumber + currency in price string
-    if "priceAsNumber" in obj:
-        amount = float(obj["priceAsNumber"])
-        currency = "USD"
-        price_str = obj.get("price", "")
-        if isinstance(price_str, str) and " " in price_str:
-            currency = price_str.split()[-1]
-        compare = None
-        before = obj.get("priceBeforeDiscountAsNumber")
-        if before and float(before) != amount:
-            compare = float(before)
-        fields["price"] = Price(price=amount, currency=currency, compare_at_price=compare)
-        return
-
-    # Pattern: prices dict with currentPrice/initialPrice
-    prices = obj.get("prices")
-    if isinstance(prices, dict) and "currentPrice" in prices:
-        current = float(prices["currentPrice"])
-        initial = prices.get("initialPrice")
-        currency = prices.get("currency", "USD")
-        compare = float(initial) if initial and float(initial) != current else None
-        fields["price"] = Price(price=current, currency=currency, compare_at_price=compare)
-        return
-
-    # Pattern: prices list with isFullPrice flag
-    if isinstance(prices, list) and prices:
-        full_entry = next((p for p in prices if p.get("isFullPrice")), None)
-        sale_entry = next((p for p in prices if not p.get("isFullPrice")), None)
-        if full_entry:
-            if sale_entry:
-                fields["price"] = Price(
-                    price=float(sale_entry["amount"]),
-                    currency="USD",
-                    compare_at_price=float(full_entry["amount"]),
-                )
-            else:
-                fields["price"] = Price(price=float(full_entry["amount"]), currency="USD")
-            return
-
-    # Pattern: price dict with msrp
-    price_obj = obj.get("price")
-    if isinstance(price_obj, dict) and ("price" in price_obj or "catalogListPrice" in price_obj):
-        amount = price_obj.get("price") or price_obj.get("catalogListPrice")
-        msrp = price_obj.get("msrp")
-        # Check for instant savings price
-        after_savings = obj.get("priceAfterInstantSavings")
-        if after_savings:
-            actual_price = float(after_savings)
-            compare = float(msrp) if msrp and float(msrp) != actual_price else None
-        else:
-            actual_price = float(amount) if amount else None
-            compare = float(msrp) if msrp and amount and float(msrp) != float(amount) else None
-        if actual_price:
-            fields["price"] = Price(
-                price=actual_price,
-                currency=price_obj.get("priceCurrency", "USD"),
-                compare_at_price=compare,
-            )
-            return
-
-    # Pattern: JSON-LD offers
+    # JSON-LD offers pattern (schema.org standard)
     offers = obj.get("offers")
     if isinstance(offers, dict) and "price" in offers:
         fields["price"] = Price(
             price=float(offers["price"]),
             currency=offers.get("priceCurrency", "USD"),
         )
+        return
+
+    # Generic recursive price extraction
+    price = _extract_price_recursive(obj)
+    if price:
+        fields["price"] = price
 
 
 def _extract_description(obj: dict, fields: dict) -> None:
     if "description" in fields:
         return
-    desc = obj.get("description") or obj.get("descriptionHtml") or obj.get("excerpt")
-    # Check nested productInfo
-    if not desc:
-        pi = obj.get("productInfo")
-        if isinstance(pi, dict):
-            desc = pi.get("productDescription")
-    # Check nested content
-    if not desc:
-        content = obj.get("content")
-        if isinstance(content, dict):
-            desc = content.get("productFullDescription") or content.get("productShortDescription")
-    # Check productDetails.details for description sections
-    # Sections may have None headers, so look for sections with prose-length content
-    if not desc:
-        pd = obj.get("productDetails")
-        if isinstance(pd, dict):
-            details_list = pd.get("details", [])
-            if isinstance(details_list, list):
-                for section in details_list:
-                    if isinstance(section, dict):
-                        detail_items = section.get("details", [])
-                        if isinstance(detail_items, list) and detail_items:
-                            # Look for sections with longer text (descriptions, not bullet features)
-                            combined = " ".join(str(d) for d in detail_items)
-                            if len(combined) > 50 and not desc:
-                                desc = combined
-    if desc and isinstance(desc, str):
-        # Clean up HTML in description if present
-        desc = re.sub(r"<[^>]+>", " ", desc)
-        desc = re.sub(r"\s+", " ", desc).strip()
-        fields["description"] = desc
+    # Try common top-level keys first
+    desc = obj.get("description") or obj.get("excerpt")
+    if desc and isinstance(desc, str) and len(desc.strip()) > 20:
+        top_level_desc = _clean_html(desc)
+    else:
+        top_level_desc = ""
+    # Recursive search for description-like keys, pick the longest
+    candidates = _find_values_by_key_pattern(obj, [_DESC_KEY_RE])
+    best = top_level_desc
+    for c in candidates:
+        if isinstance(c, str) and len(c.strip()) > len(best):
+            best = _clean_html(c.strip())
+    if len(best) > 60:
+        fields["description"] = best
 
 
 def _extract_features(obj: dict, fields: dict) -> None:
@@ -504,58 +643,47 @@ def _extract_features(obj: dict, fields: dict) -> None:
         return
     features: list[str] = []
 
-    # Pattern: positiveNotes array
+    # Schema.org positiveNotes (standard field)
     notes = obj.get("positiveNotes")
     if isinstance(notes, list):
         features.extend(str(n) for n in notes if n)
 
-    # Pattern: featuresAndBenefits / productDetails in productInfo
-    pi = obj.get("productInfo")
-    if isinstance(pi, dict):
-        for key in ("featuresAndBenefits", "productDetails"):
-            sections = pi.get(key, [])
-            if isinstance(sections, list):
-                for section in sections:
-                    if isinstance(section, dict):
-                        body = section.get("body", [])
-                        if isinstance(body, list):
-                            features.extend(str(b) for b in body if b)
+    # Recursive search for feature/benefit/highlight arrays
+    if not features:
+        candidates = _find_values_by_key_pattern(obj, [_FEATURE_KEY_RE])
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                for item in candidate:
+                    if isinstance(item, str) and item.strip():
+                        features.append(item.strip())
+                    elif isinstance(item, dict):
+                        # Extract text from dict items (e.g., {body: [...]} sections)
+                        for v in item.values():
+                            if isinstance(v, str) and len(v.strip()) > 5:
+                                features.append(v.strip())
+                            elif isinstance(v, list):
+                                features.extend(str(x) for x in v if x and isinstance(x, str))
+            elif isinstance(candidate, str) and len(candidate.strip()) > 5:
+                features.append(candidate.strip())
 
-    # Pattern: productDetails.details sections
-    # Sections have name/title/details — headers may be None, so extract from all
-    pd = obj.get("productDetails")
-    if isinstance(pd, dict):
-        details_list = pd.get("details", [])
-        if isinstance(details_list, list):
-            for section in details_list:
-                if isinstance(section, dict):
-                    detail_items = section.get("details", [])
-                    if isinstance(detail_items, list):
-                        features.extend(str(d) for d in detail_items if d)
-
-    # Pattern: properties with feature in attributeFQN
-    props = obj.get("properties")
-    if isinstance(props, list):
-        for p in props:
-            if isinstance(p, dict):
-                fqn = str(p.get("attributeFQN", ""))
-                if "feature" in fqn.lower() and "text" in fqn.lower():
-                    vals = p.get("values", [])
-                    if isinstance(vals, list) and vals:
-                        val = vals[0].get("value") if isinstance(vals[0], dict) else vals[0]
-                        if val:
-                            features.append(str(val))
-
-    # Pattern: bullet-formatted description
-    desc = obj.get("description", "")
-    if isinstance(desc, str) and "\n-" in desc and not features:
-        for line in desc.split("\n"):
-            line = line.strip().lstrip("- ").strip()
-            if line and len(line) > 3:
-                features.append(line)
+    # Bullet-formatted description fallback
+    if not features:
+        desc = obj.get("description", "")
+        if isinstance(desc, str) and "\n-" in desc:
+            for line in desc.split("\n"):
+                line = line.strip().lstrip("- ").strip()
+                if line and len(line) > 3:
+                    features.append(line)
 
     if features:
-        fields["key_features"] = features
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for f in features:
+            if f not in seen:
+                seen.add(f)
+                unique.append(f)
+        fields["key_features"] = unique
 
 
 def _extract_images_from_obj(obj: dict, fields: dict) -> None:
@@ -563,80 +691,30 @@ def _extract_images_from_obj(obj: dict, fields: dict) -> None:
         return
     urls: list[str] = []
 
-    # Pattern: mediaObjects with sources dict
-    # Structure: mediaObjects[].sources.{mini,thumb,standard,full,max}[].url
-    media_objs = obj.get("mediaObjects")
-    if isinstance(media_objs, list):
-        for mo in media_objs:
-            if not isinstance(mo, dict):
-                continue
-            sources = mo.get("sources")
-            if isinstance(sources, dict):
-                # Prefer highest resolution
-                for size_key in ("max", "full", "standard"):
-                    variants = sources.get(size_key)
-                    if isinstance(variants, list) and variants:
-                        first = variants[0]
-                        if isinstance(first, dict) and first.get("url"):
-                            urls.append(first["url"])
-                            break
-
-    # Pattern: contentImages with properties
-    content_imgs = obj.get("contentImages")
-    if isinstance(content_imgs, list):
-        for ci in content_imgs:
-            if isinstance(ci, dict):
-                props = ci.get("properties", {})
-                if isinstance(props, dict):
-                    for key in ("squarish", "portrait"):
-                        img = props.get(key, {})
-                        if isinstance(img, dict) and img.get("url"):
-                            urls.append(img["url"])
-                            break
-
-    # Pattern: media list with src
-    media_list = obj.get("media")
-    if isinstance(media_list, list):
-        for m in media_list:
-            if isinstance(m, dict) and m.get("src"):
-                urls.append(m["src"])
-
-    # Pattern: content.productImages
-    content = obj.get("content")
-    if isinstance(content, dict):
-        prod_imgs = content.get("productImages")
-        if isinstance(prod_imgs, list):
-            for pi in prod_imgs:
-                if isinstance(pi, dict):
-                    url = pi.get("imageUrl") or pi.get("src")
-                    if url:
-                        urls.append(url)
-
-    # Pattern: images array
-    images = obj.get("images")
-    if isinstance(images, list):
-        for img in images:
-            if isinstance(img, str):
-                urls.append(img)
-
-    # Pattern: single image string (JSON-LD)
+    # Generic top-level keys
     image = obj.get("image")
     if isinstance(image, str):
         urls.append(image)
     elif isinstance(image, list):
         urls.extend(str(i) for i in image if isinstance(i, str))
 
-    # Normalize and deduplicate
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for url in urls:
-        url = url.strip()
-        if url.startswith("//"):
-            url = "https:" + url
-        if url and url not in seen:
-            seen.add(url)
-            normalized.append(url)
+    images = obj.get("images")
+    if isinstance(images, list):
+        for img in images:
+            if isinstance(img, str):
+                urls.append(img)
 
+    media_list = obj.get("media")
+    if isinstance(media_list, list):
+        for m in media_list:
+            if isinstance(m, dict) and m.get("src"):
+                urls.append(m["src"])
+
+    # Recursive collection from all nested data
+    recursive_urls = _collect_image_urls_recursive(obj)
+    urls.extend(recursive_urls)
+
+    normalized = _normalize_and_dedup_urls(urls)
     if normalized:
         fields["image_urls"] = normalized
 
@@ -644,12 +722,10 @@ def _extract_images_from_obj(obj: dict, fields: dict) -> None:
 def _extract_video_from_obj(obj: dict, fields: dict) -> None:
     if "video_url" in fields:
         return
-    # Pattern: var_video.file.url
-    var_video = obj.get("var_video")
-    if isinstance(var_video, dict):
-        f = var_video.get("file")
-        if isinstance(f, dict) and f.get("url"):
-            fields["video_url"] = f["url"]
+    # Recursive search for video URLs at any depth
+    video_urls = _collect_video_urls_recursive(obj)
+    if video_urls:
+        fields["video_url"] = video_urls[0]
 
 
 def _extract_colors(obj: dict, fields: dict) -> None:
@@ -657,7 +733,7 @@ def _extract_colors(obj: dict, fields: dict) -> None:
         return
     colors: list[str] = []
 
-    # Pattern: questions with type COLOR
+    # Generic: questions with type COLOR (common quiz/dimension pattern)
     questions = obj.get("questions")
     if isinstance(questions, list):
         for q in questions:
@@ -668,57 +744,58 @@ def _extract_colors(obj: dict, fields: dict) -> None:
                         if isinstance(a, dict) and a.get("title"):
                             colors.append(a["title"])
 
-    # Pattern: colorDescription string
-    cd = obj.get("colorDescription")
-    if isinstance(cd, str) and cd and not colors:
-        colors = [cd]
-
-    # Pattern: relatedVariantProducts with color_swatch.name or variantName
-    related = obj.get("relatedVariantProducts")
-    if isinstance(related, list) and not colors:
-        for r in related:
-            if isinstance(r, dict):
-                # Try color_swatch.name first, then variantName
-                swatch = r.get("color_swatch")
-                vn = (swatch.get("name") if isinstance(swatch, dict) else None) or r.get("variantName")
-                if vn and isinstance(vn, str) and vn not in colors:
-                    colors.append(vn)
-        # Also add current variant name
-        current_vn = obj.get("variantName")
-        if current_vn and isinstance(current_vn, str) and current_vn not in colors:
-            colors.insert(0, current_vn)
-
-    # Pattern: color_swatch or color_group
+    # Recursive search for color-like values
     if not colors:
-        swatch = obj.get("color_swatch") or obj.get("color_group")
-        if isinstance(swatch, dict) and swatch.get("name"):
-            colors = [swatch["name"]]
+        candidates = _find_values_by_key_pattern(obj, [_COLOR_KEY_RE])
+        for c in candidates:
+            if isinstance(c, str) and _is_color_name(c):
+                if c.strip() not in colors:
+                    colors.append(c.strip())
+            elif isinstance(c, dict):
+                name = c.get("name") or c.get("title")
+                if name and isinstance(name, str) and _is_color_name(name) and name not in colors:
+                    colors.append(name)
+            elif isinstance(c, list):
+                for item in c:
+                    if isinstance(item, str) and _is_color_name(item):
+                        if item.strip() not in colors:
+                            colors.append(item.strip())
+                    elif isinstance(item, dict):
+                        name = item.get("name") or item.get("title")
+                        if name and isinstance(name, str) and _is_color_name(name) and name not in colors:
+                            colors.append(name)
 
     if colors:
         fields["colors"] = colors
 
 
 def _extract_colors_from_all_data(embedded_json: dict[str, Any], fields: dict) -> None:
-    """Extract colors from data structures not directly on the product object.
-
-    Some sites store colorway info at a sibling level to the product object.
-    Overrides existing colors if this source has more.
-    """
+    """Extract colors from embedded JSON sources outside the main product object."""
     existing_count = len(fields.get("colors", []))
 
-    # Look for colorwayImages at any nesting level
     for data in embedded_json.values():
-        cw_images = _find_key_recursive(data, "colorwayImages")
-        if isinstance(cw_images, list) and cw_images:
-            colors = []
-            for cw in cw_images:
-                if isinstance(cw, dict):
-                    desc = cw.get("colorDescription")
-                    if desc and isinstance(desc, str) and desc not in colors:
-                        colors.append(desc)
-            if colors and len(colors) > existing_count:
-                fields["colors"] = colors
-                return
+        candidates = _find_values_by_key_pattern(data, [_COLOR_KEY_RE])
+        colors = []
+        for c in candidates:
+            if isinstance(c, str) and _is_color_name(c):
+                if c.strip() not in colors:
+                    colors.append(c.strip())
+            elif isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict):
+                        # Extract color name from objects in color arrays
+                        name = None
+                        for k, v in item.items():
+                            if _COLOR_KEY_RE.search(k) and isinstance(v, str) and _is_color_name(v):
+                                name = v.strip()
+                                break
+                        if not name:
+                            name = item.get("name") or item.get("title")
+                        if name and isinstance(name, str) and _is_color_name(name) and name not in colors:
+                            colors.append(name)
+        if colors and len(colors) > existing_count:
+            fields["colors"] = colors
+            return
 
 
 def _find_key_recursive(data: Any, key: str, depth: int = 0) -> Any:
@@ -743,10 +820,8 @@ def _find_key_recursive(data: Any, key: str, depth: int = 0) -> Any:
 def _extract_variants(obj: dict, fields: dict) -> None:
     if "variants" in fields and fields["variants"]:
         return
-    variants: list[Variant] = []
 
-    # Pattern: questions + skus cross-reference
-    # Check this FIRST because it's richer than items when both exist
+    # Generic: questions + skus cross-reference (common quiz/dimension pattern)
     questions = obj.get("questions")
     skus_list = obj.get("skus")
     if isinstance(questions, list) and isinstance(skus_list, list) and questions and skus_list:
@@ -755,13 +830,13 @@ def _extract_variants(obj: dict, fields: dict) -> None:
             fields["variants"] = variants
             return
 
-    # Pattern: items with name/sku/ean
+    # Generic: items with name/sku/ean
     items = obj.get("items")
     if isinstance(items, list) and items:
+        variants: list[Variant] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            # Skip items without identifiers (likely category labels, not variants)
             if not item.get("sku") and not item.get("ean"):
                 continue
             attrs = {}
@@ -770,7 +845,6 @@ def _extract_variants(obj: dict, fields: dict) -> None:
                 attrs["size"] = str(name)
             sku = item.get("sku") or item.get("item")
             ean = item.get("ean") or item.get("upc")
-            # Check stock for availability
             stock = item.get("stock")
             available = True
             if isinstance(stock, (int, float)):
@@ -788,48 +862,82 @@ def _extract_variants(obj: dict, fields: dict) -> None:
             fields["variants"] = variants
             return
 
-    # Pattern: sizes list with label/gtins/status
-    sizes = obj.get("sizes")
-    if isinstance(sizes, list) and sizes and isinstance(sizes[0], dict) and "label" in sizes[0]:
-        color_desc = obj.get("colorDescription", "")
-        for size in sizes:
-            if not isinstance(size, dict):
-                continue
-            attrs: dict[str, str] = {"size": str(size.get("label", ""))}
-            if color_desc:
-                attrs["color"] = color_desc
-            gtin = None
-            gtins = size.get("gtins")
-            if isinstance(gtins, list) and gtins:
-                first_gtin = gtins[0]
-                if isinstance(first_gtin, dict):
-                    gtin = first_gtin.get("gtin")
-                elif isinstance(first_gtin, str):
-                    gtin = first_gtin
-            variants.append(Variant(
-                attributes=attrs,
-                sku=size.get("merchSkuId"),
-                gtin=str(gtin) if gtin else None,
-                available=size.get("status") == "ACTIVE",
-            ))
+    # Generic variant array detection at any depth
+    variant_arrays = _find_variant_arrays(obj)
+    if variant_arrays:
+        best_array = max(variant_arrays, key=len)
+        variants = _build_variants_from_generic_array(best_array)
         if variants:
             fields["variants"] = variants
-            return
+
+
+def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
+    """Build Variant objects from a generic array of variant-like dicts."""
+    variants: list[Variant] = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+
+        attrs: dict[str, str] = {}
+        sku = None
+        gtin = None
+        available = True
+
+        for k, v in item.items():
+            if _VARIANT_SIZE_KEYS.match(k):
+                attrs["size"] = str(v)
+            elif _VARIANT_COLOR_KEYS.match(k):
+                if isinstance(v, str):
+                    attrs["color"] = v
+                elif isinstance(v, dict) and v.get("name"):
+                    attrs["color"] = v["name"]
+            elif _VARIANT_SKU_KEYS.match(k) and sku is None:
+                sku = str(v)
+            elif _VARIANT_GTIN_KEYS.match(k):
+                if isinstance(v, str):
+                    gtin = v
+                elif isinstance(v, list) and v:
+                    first = v[0]
+                    if isinstance(first, str):
+                        gtin = first
+                    elif isinstance(first, dict):
+                        gtin = str(next(iter(first.values()), ""))
+            elif _VARIANT_AVAIL_KEYS.match(k):
+                if isinstance(v, str):
+                    available = v.upper() not in ("OUT_OF_STOCK", "UNAVAILABLE", "INACTIVE", "SOLD_OUT")
+                elif isinstance(v, bool):
+                    available = v
+                elif isinstance(v, (int, float)):
+                    available = v > 0
+                elif isinstance(v, dict):
+                    status = str(v.get("status", "")).upper()
+                    available = status not in ("OUT_OF_STOCK", "UNAVAILABLE")
+
+        if not attrs:
+            name = item.get("name")
+            if name:
+                attrs["size"] = str(name)
+
+        if attrs or sku:
+            variants.append(Variant(
+                attributes=attrs,
+                sku=sku,
+                gtin=gtin,
+                available=available,
+            ))
+
+    return variants
 
 
 def _build_variants_from_questions(questions: list, skus_list: list) -> list[Variant]:
     """Build variants from questions/answers + SKU cross-reference."""
-    # Build reverse lookup: sku_id -> {dimension_type: answer_title}
     sku_attrs: dict[str, dict[str, str]] = {}
 
     for q in questions:
         if not isinstance(q, dict):
             continue
         q_type = str(q.get("type", "")).lower()
-        # Map question type to attribute name
-        attr_name = q_type  # "color", "size", "item" (fit)
-        if attr_name == "item":
-            attr_name = "fit"
+        attr_name = q_type
 
         answers = q.get("answers", [])
         if not isinstance(answers, list):
@@ -847,7 +955,6 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
                     sku_attrs[sid_str] = {}
                 sku_attrs[sid_str][attr_name] = title
 
-    # Build variants from SKU list
     variants: list[Variant] = []
     for sku in skus_list:
         if not isinstance(sku, dict):
@@ -907,7 +1014,9 @@ def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
             fields["brand"] = str(brand)
 
     if "description" not in fields and ld.get("description"):
-        fields["description"] = ld["description"]
+        desc_text = str(ld["description"]).strip()
+        if len(desc_text) > 60:
+            fields["description"] = desc_text
 
     # Price from offers
     if "price" not in fields:
@@ -993,7 +1102,9 @@ def _extract_fields_from_og(og: dict, fields: dict) -> None:
     if "name" not in fields and og.get("title"):
         fields["name"] = og["title"]
     if "description" not in fields and og.get("description"):
-        fields["description"] = og["description"]
+        og_desc = str(og["description"]).strip()
+        if len(og_desc) > 60:
+            fields["description"] = og_desc
     if ("image_urls" not in fields or not fields.get("image_urls")) and og.get("image"):
         fields["image_urls"] = [og["image"]]
     if "brand" not in fields and og.get("site_name"):
