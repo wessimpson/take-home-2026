@@ -7,7 +7,6 @@ Three stages:
   C) Validate with Pydantic, retry category with taxonomy subset on failure
 """
 
-import difflib
 import html as html_lib
 import logging
 import re
@@ -18,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 import ai
+import taxonomy
 from models import VALID_CATEGORIES, Category, Price, Product, Variant
 from parser import ParsedPage
 
@@ -36,100 +36,8 @@ PRODUCT_SIGNAL_KEYS = {
     "color", "colors", "questions",
 }
 
-# Deeper keyword-to-prefix mapping for taxonomy narrowing.
-# Ordered most-specific to least-specific; first match wins.
-# When a keyword matches, we send only categories under that prefix to the LLM.
-_TAXONOMY_PREFIX_MAP: list[tuple[str, list[str]]] = [
-    # Hardware - specific tool types
-    ("Hardware > Tools > Drills", ["drill", "driver kit", "impact driver"]),
-    ("Hardware > Tools > Saws", ["chainsaw", "jigsaw", "circular saw", "miter saw", "table saw", "band saw"]),
-    ("Hardware > Tools > Sanders", ["sander"]),
-    ("Hardware > Tools > Grinders", ["grinder", "angle grinder"]),
-    ("Hardware > Tools > Nailers & Staplers", ["nailer", "nail gun", "staple gun"]),
-    ("Hardware > Tools", ["power tool", "wrench", "screwdriver", "hammer", "plier", "tool set", "tool kit"]),
-    ("Hardware", ["hardware", "plumbing"]),
-    # Home & Garden
-    ("Home & Garden > Lighting", ["lamp", "lighting", "chandelier", "sconce", "lantern", "pendant light"]),
-    ("Home & Garden > Kitchen & Dining", ["kitchen", "cookware", "bakeware", "dinnerware"]),
-    ("Home & Garden > Lawn & Garden", ["lawn mower", "garden tool", "trimmer"]),
-    ("Home & Garden", ["furniture", "garden", "rug", "pillow", "curtain", "bedding", "decor"]),
-    # Apparel & Accessories
-    ("Apparel & Accessories > Shoes", ["shoe", "sneaker", "boot", "sandal", "slipper", "loafer"]),
-    ("Apparel & Accessories > Clothing", ["shirt", "henley", "pant", "trouser", "dress", "jacket", "sweater", "coat", "hoodie", "polo"]),
-    ("Apparel & Accessories", ["clothing", "apparel", "wear", "accessory"]),
-    # Electronics
-    ("Electronics > Audio", ["headphone", "speaker", "earbuds"]),
-    ("Electronics > Computers", ["laptop", "computer", "tablet"]),
-    ("Electronics", ["phone", "camera", "electronic"]),
-    # Sporting Goods
-    ("Sporting Goods > Exercise & Fitness", ["treadmill", "elliptical", "exercise bike"]),
-    ("Sporting Goods", ["sport", "fitness", "gym", "ball", "racket", "bicycle", "bike"]),
-]
-
-# Pre-built lookup: lowercase -> exact category (for case-insensitive matching)
-_CATEGORY_LOWER = {c.lower(): c for c in VALID_CATEGORIES}
-
-# Pre-built lookup: leaf term -> list of categories containing it
-_CATEGORY_BY_LEAF: dict[str, list[str]] = {}
-for _cat in VALID_CATEGORIES:
-    _leaf = _cat.rsplit(" > ", 1)[-1].lower()
-    _CATEGORY_BY_LEAF.setdefault(_leaf, []).append(_cat)
-
 # Model to use for LLM gap-filling
 LLM_MODEL = "google/gemini-2.0-flash-lite-001"
-
-
-def _fuzzy_match_category(raw: str) -> str | None:
-    """Try to match a raw category string to a valid taxonomy entry without LLM.
-
-    Strategies tried in order:
-    1. Exact match
-    2. Case-insensitive match
-    3. Leaf-term match (most specific segment matches a taxonomy leaf)
-    4. Path-aware difflib (match within the guessed top-level subset)
-    Returns None if no confident match found.
-    """
-    if not raw:
-        return None
-
-    # 1. Exact match
-    if raw in VALID_CATEGORIES:
-        return raw
-
-    # 2. Case-insensitive
-    lower = raw.lower()
-    if lower in _CATEGORY_LOWER:
-        return _CATEGORY_LOWER[lower]
-
-    # 3. Leaf-term match: take the LLM's most specific term and find categories ending with it
-    leaf = raw.rsplit(" > ", 1)[-1].strip().lower()
-    if leaf in _CATEGORY_BY_LEAF:
-        candidates = _CATEGORY_BY_LEAF[leaf]
-        if len(candidates) == 1:
-            return candidates[0]
-        # Multiple candidates — pick the one whose path best matches the LLM's output
-        best = difflib.get_close_matches(raw, candidates, n=1, cutoff=0.4)
-        if best:
-            return best[0]
-        # Just return the most specific (longest path)
-        return max(candidates, key=len)
-
-    # 4. Path-aware difflib (match within top-level subset for better results)
-    top_parts = raw.split(" > ")
-    if top_parts:
-        top_guess = top_parts[0]
-        subset = [c for c in VALID_CATEGORIES if c.startswith(top_guess)]
-        if subset:
-            matches = difflib.get_close_matches(raw, subset, n=1, cutoff=0.5)
-            if matches:
-                return matches[0]
-
-    # Full taxonomy difflib as absolute last resort
-    matches = difflib.get_close_matches(raw, VALID_CATEGORIES, n=1, cutoff=0.6)
-    if matches:
-        return matches[0]
-
-    return None
 
 
 # ===== Metrics =====
@@ -231,7 +139,7 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
     elif cat_first_valid and not cat_fuzzy:
         metrics.category_resolution = "llm_exact"
     elif cat_fuzzy:
-        metrics.category_resolution = "fuzzy_match"
+        metrics.category_resolution = "taxonomy_resolved"
     elif cat_retry_ok:
         metrics.category_resolution = "llm_retry"
     else:
@@ -502,9 +410,10 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
     if "video_url" not in fields and parsed.video_urls:
         fields["video_url"] = parsed.video_urls[0]
 
-    # 7. Breadcrumbs as category hint
+    # 7. Breadcrumbs as category hint (exclude last segment — usually the product name)
     if "category" not in fields and parsed.breadcrumbs:
-        fields.setdefault("_category_hints", []).append(" > ".join(parsed.breadcrumbs))
+        cat_crumbs = parsed.breadcrumbs[:-1] if len(parsed.breadcrumbs) > 1 else parsed.breadcrumbs
+        fields.setdefault("_category_hints", []).append(" > ".join(cat_crumbs))
 
     return fields
 
@@ -1221,10 +1130,19 @@ async def _call_llm_for_gaps(context: str, fill_fields: list[str], fields: dict,
         "Extract the requested fields from the product context provided. "
     )
 
-    # If category is needed, include focused taxonomy subset
+    # If category is needed, use taxonomy tree to narrow candidates
     if "category" in fill_fields:
-        subset = _build_taxonomy_subset(fields, parsed)
-        logger.info(f"  Taxonomy subset: {len(subset)} categories")
+        signals = _collect_taxonomy_signals(fields, parsed)
+        confident, candidates = taxonomy.classify(signals, top_n=15)
+        if confident:
+            # Taxonomy tree found a confident match — skip LLM for category
+            logger.info(f"  Taxonomy tree match: {confident}")
+            fields["category"] = confident
+            fill_fields = [f for f in fill_fields if f != "category"]
+            if not fill_fields:
+                return LLMGapFill(category=confident)
+        subset = candidates if len(candidates) >= 3 else sorted(VALID_CATEGORIES)[:200]
+        logger.info(f"  Taxonomy candidates: {len(subset)} categories")
         system += (
             "For category, you MUST pick one EXACTLY from the provided list. "
             "IMPORTANT: Always choose the MOST SPECIFIC (deepest) category that fits. "
@@ -1264,25 +1182,37 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
     """
     _set_defaults(fields)
 
-    # Try fuzzy matching the category BEFORE Pydantic validation
+    # Try resolving the category via taxonomy tree BEFORE Pydantic validation
     cat_str = fields.get("category", "")
     if isinstance(cat_str, Category):
         cat_str = cat_str.name
-    original_cat = cat_str
     fuzzy_resolved = False
     if isinstance(cat_str, str) and cat_str not in VALID_CATEGORIES:
-        # Also try category hints from structured data
+        # Try the category string and any hints from structured data
         candidates_to_try = [cat_str]
         for hint in fields.get("_category_hints", []):
             if hint not in candidates_to_try:
                 candidates_to_try.append(hint)
         for candidate in candidates_to_try:
-            fuzzy = _fuzzy_match_category(candidate)
-            if fuzzy:
-                logger.info(f"  Fuzzy matched category: '{candidate}' -> '{fuzzy}'")
-                cat_str = fuzzy
+            resolved = taxonomy.resolve(candidate)
+            if resolved:
+                logger.info(f"  Taxonomy resolved: '{candidate}' -> '{resolved}'")
+                cat_str = resolved
                 fuzzy_resolved = True
                 break
+
+        # If resolve() failed, try classify() with all available signals
+        if not fuzzy_resolved:
+            classify_signals = list(candidates_to_try)
+            if fields.get("name"):
+                classify_signals.append(fields["name"])
+            if fields.get("description"):
+                classify_signals.append(str(fields["description"])[:200])
+            confident, _ = taxonomy.classify(classify_signals)
+            if confident:
+                logger.info(f"  Taxonomy classified: '{cat_str}' -> '{confident}'")
+                cat_str = confident
+                fuzzy_resolved = True
 
     fields["category"] = {"name": cat_str}
 
@@ -1308,7 +1238,7 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
         cat_errors = [err for err in e.errors() if "category" in str(err.get("loc", []))]
         if cat_errors:
             logger.info(f"  Category validation failed, retrying with taxonomy subset...")
-            # Restore hints so _build_taxonomy_subset can use them during retry
+            # Restore hints so taxonomy signals can use them during retry
             fields["_category_hints"] = saved_hints
             new_cat = await _retry_category(fields, parsed)
             fields.pop("_category_hints", None)
@@ -1322,7 +1252,14 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
 
 async def _retry_category(fields: dict, parsed: ParsedPage) -> str | None:
     """Retry category selection with a broader taxonomy subset."""
-    subset = _build_taxonomy_subset(fields, parsed, broaden=True)
+    # Use taxonomy tree: get candidates and broaden from the best match
+    signals = _collect_taxonomy_signals(fields, parsed)
+    _, candidates = taxonomy.classify(signals, top_n=15)
+    if candidates:
+        # Broaden from the top candidate's subtree
+        subset = taxonomy.broaden(candidates[0])
+    else:
+        subset = sorted(VALID_CATEGORIES)[:200]
 
     logger.info(f"  Retrying with {len(subset)} categories (broadened)")
 
@@ -1350,55 +1287,24 @@ async def _retry_category(fields: dict, parsed: ParsedPage) -> str | None:
     return None
 
 
-def _find_taxonomy_prefix(text: str) -> str:
-    """Find the deepest matching taxonomy prefix from product text signals."""
-    for prefix, keywords in _TAXONOMY_PREFIX_MAP:
-        if any(kw in text for kw in keywords):
-            return prefix
-    return ""
+def _collect_taxonomy_signals(fields: dict, parsed: ParsedPage) -> list[str]:
+    """Collect product text signals for taxonomy classification.
 
-
-def _build_taxonomy_subset(fields: dict, parsed: ParsedPage, broaden: bool = False) -> list[str]:
-    """Build a focused taxonomy subset from product signals.
-
-    Narrows the ~5500 taxonomy entries to a relevant subtree (often 6-50 entries)
-    using deep keyword matching against product name, hints, and breadcrumbs.
-
-    Args:
-        broaden: If True, use one level above the focused prefix (for retry).
+    Excludes brand (brand names like 'L.L.Bean' cause false matches in taxonomy).
+    Skips last breadcrumb segment (usually the product name, not a category).
     """
-    # Collect all text signals
-    parts = [
-        fields.get("name", ""),
-        str(fields.get("description", ""))[:300],
-        fields.get("brand", ""),
-    ]
+    signals = []
+    if fields.get("name"):
+        signals.append(fields["name"])
+    if fields.get("description"):
+        signals.append(str(fields["description"])[:300])
     for hint in fields.get("_category_hints", []):
-        parts.append(hint)
-    for bc in parsed.breadcrumbs:
-        parts.append(bc)
-    text = " ".join(parts).lower()
-
-    prefix = _find_taxonomy_prefix(text)
-
-    # For retry, go one level broader
-    if broaden and prefix and " > " in prefix:
-        prefix = prefix.rsplit(" > ", 1)[0]
-
-    if not prefix:
-        return sorted(VALID_CATEGORIES)[:200]
-
-    subset = sorted(c for c in VALID_CATEGORIES if c.startswith(prefix))
-
-    # If subset is too small, broaden one level at a time
-    while len(subset) < 5 and " > " in prefix:
-        prefix = prefix.rsplit(" > ", 1)[0]
-        subset = sorted(c for c in VALID_CATEGORIES if c.startswith(prefix))
-
-    if len(subset) < 5:
-        return sorted(VALID_CATEGORIES)[:200]
-
-    return subset[:250]
+        signals.append(hint)
+    # Skip last breadcrumb (usually the product name, not a category level)
+    bc_list = parsed.breadcrumbs[:-1] if len(parsed.breadcrumbs) > 1 else parsed.breadcrumbs
+    for bc in bc_list:
+        signals.append(bc)
+    return signals
 
 
 def _set_defaults(fields: dict) -> None:
