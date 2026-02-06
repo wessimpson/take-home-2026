@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ParsedPage:
     """All structured data extracted from an HTML page."""
+
     json_ld: list[dict] = field(default_factory=list)
     og_tags: dict[str, str] = field(default_factory=dict)
     embedded_json: dict[str, Any] = field(default_factory=dict)
@@ -61,6 +62,7 @@ def parse_html(html: str) -> ParsedPage:
 # JSON-LD
 # ---------------------------------------------------------------------------
 
+
 def _extract_json_ld(soup: BeautifulSoup) -> list[dict]:
     """Extract all JSON-LD blocks from <script type="application/ld+json"> tags."""
     results: list[dict] = []
@@ -84,16 +86,24 @@ def _extract_json_ld(soup: BeautifulSoup) -> list[dict]:
 # Open Graph meta tags
 # ---------------------------------------------------------------------------
 
+
 def _extract_og_tags(soup: BeautifulSoup) -> dict[str, str]:
-    """Extract Open Graph meta tags. Handles both property= and name= attributes."""
+    """Extract Open Graph and product meta tags. Handles both property= and name= attributes."""
     tags: dict[str, str] = {}
     for meta in soup.find_all("meta"):
         prop = meta.get("property", "") or meta.get("name", "")
-        if isinstance(prop, str) and prop.startswith("og:"):
-            content = meta.get("content", "")
-            if content:
-                # Strip "og:" prefix for cleaner keys
-                key = prop[3:]
+        if not isinstance(prop, str):
+            continue
+        content = meta.get("content", "")
+        if not content:
+            continue
+        if prop.startswith("og:"):
+            key = prop[3:]
+            tags[key] = content
+        elif prop.startswith("product:"):
+            # Facebook product tags (e.g., product:price:amount -> price:amount)
+            key = prop[8:]
+            if key not in tags:
                 tags[key] = content
     return tags
 
@@ -101,6 +111,7 @@ def _extract_og_tags(soup: BeautifulSoup) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Embedded JSON state objects
 # ---------------------------------------------------------------------------
+
 
 def _extract_embedded_json(soup: BeautifulSoup, html: str) -> dict[str, Any]:
     """Extract embedded JSON from script tags and window global assignments."""
@@ -121,6 +132,9 @@ def _extract_embedded_json(soup: BeautifulSoup, html: str) -> dict[str, Any]:
 
     # Pattern 2: window.__VARIABLE__ = {...} assignments
     _extract_window_globals(soup, results)
+
+    # Pattern 3: analytics tracking calls with product data (e.g., Shopify)
+    _extract_analytics_tracking(soup, results)
 
     return results
 
@@ -160,6 +174,37 @@ def _extract_window_globals(soup: BeautifulSoup, results: dict[str, Any]) -> Non
                 results[var_name] = json.loads(json_str)
             except (json.JSONDecodeError, TypeError):
                 logger.debug(f"Skipping malformed JSON for {var_name}")
+
+
+def _extract_analytics_tracking(soup: BeautifulSoup, results: dict[str, Any]) -> None:
+    """Extract product data from analytics tracking calls (e.g., Shopify).
+
+    Matches: .track("Viewed Product",{...})
+    """
+    pattern = re.compile(r'\.track\(\s*"Viewed Product"\s*,\s*')
+
+    for tag in soup.find_all("script"):
+        if tag.get("src") or tag.get("type") in ("application/json", "text/json", "application/ld+json"):
+            continue
+        text = tag.string
+        if not text:
+            continue
+
+        match = pattern.search(text)
+        if not match:
+            continue
+
+        json_str = _brace_match(text, match.end())
+        if not json_str:
+            continue
+
+        try:
+            data = json.loads(json_str)
+            if isinstance(data, dict) and data.get("name"):
+                results["_analytics_tracked_product"] = data
+                return
+        except (json.JSONDecodeError, TypeError):
+            logger.debug("Skipping malformed analytics tracking JSON")
 
 
 def _brace_match(text: str, start: int) -> str | None:
@@ -214,6 +259,7 @@ def _brace_match(text: str, start: int) -> str | None:
 # Body text extraction
 # ---------------------------------------------------------------------------
 
+
 def _extract_body_text(soup: BeautifulSoup) -> str:
     """Extract visible text from the page body, stripping noise elements."""
     body = soup.find("body")
@@ -238,6 +284,7 @@ def _extract_body_text(soup: BeautifulSoup) -> str:
 # ---------------------------------------------------------------------------
 # Image URL extraction
 # ---------------------------------------------------------------------------
+
 
 def _extract_image_urls(soup: BeautifulSoup) -> list[str]:
     """Extract all image URLs from <img> tags (src and data-src)."""
@@ -274,6 +321,7 @@ def _looks_like_image_url(url: str) -> bool:
 # Video URL extraction
 # ---------------------------------------------------------------------------
 
+
 def _extract_video_urls(html: str) -> list[str]:
     """Extract video URLs (.mp4, .webm) from the HTML."""
     pattern = re.compile(r'https?://[^\s"\'<>]+\.(?:mp4|webm)', re.IGNORECASE)
@@ -284,6 +332,7 @@ def _extract_video_urls(html: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Standard meta tags
 # ---------------------------------------------------------------------------
+
 
 def _extract_meta_tags(soup: BeautifulSoup) -> dict[str, str]:
     """Extract standard meta tags (description, keywords, etc.)."""
@@ -298,6 +347,7 @@ def _extract_meta_tags(soup: BeautifulSoup) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Breadcrumb extraction
 # ---------------------------------------------------------------------------
+
 
 def _extract_breadcrumbs(json_ld: list[dict], soup: BeautifulSoup) -> list[str]:
     """Extract breadcrumb trail from JSON-LD BreadcrumbList or microdata.
