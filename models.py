@@ -1,4 +1,3 @@
-from typing import Any
 from pathlib import Path
 from pydantic import BaseModel, field_validator
 
@@ -30,7 +29,17 @@ class Price(BaseModel):
     # If a product is on sale, this is the original price
     compare_at_price: float | None = None
 
-# This is the final product schema that you need to output. 
+
+class Variant(BaseModel):
+    attributes: dict[str, str]  # e.g. {"size": "10", "color": "Black", "fit": "Regular"}
+    sku: str | None = None
+    gtin: str | None = None
+    price: Price | None = None  # only if different from base product price
+    image_url: str | None = None  # only if variant has its own image
+    available: bool = True
+
+
+# This is the final product schema that you need to output.
 # You may add additional models as needed.
 class Product(BaseModel):
     name: str
@@ -42,4 +51,4 @@ class Product(BaseModel):
     category: Category
     brand: str
     colors: list[str]
-    variants: list[Any] # TODO (@dev): Define variant model
+    variants: list[Variant]
