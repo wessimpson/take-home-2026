@@ -196,6 +196,18 @@ def print_report(
     for m in all_metrics:
         print(f"    {m.filename:<25} {m.category_resolution}")
 
+    # ── QA Validation ──────────────────────────────────────────────
+    print("\n── QA Validation ──")
+    qa_passed = sum(1 for m in all_metrics if m.qa_passed)
+    qa_issues_total = sum(len(m.qa_issues) for m in all_metrics)
+    print(f"  Passed (no issues):    {qa_passed}/{n}")
+    print(f"  Total issues found:    {qa_issues_total}")
+    for m in all_metrics:
+        if m.qa_passed:
+            print(f"    {m.filename:<25} passed")
+        else:
+            print(f"    {m.filename:<25} {len(m.qa_issues)} issues: {'; '.join(m.qa_issues[:3])}")
+
     # ── Output Richness ─────────────────────────────────────────────
     print("\n── Output Richness ──")
     print(f"  {'File':<25} {'Variants':>9} {'Images':>8} {'Features':>9} {'Colors':>8} {'Video':>7} {'Sale':>6}")
@@ -221,24 +233,27 @@ def print_report(
     # ── Timing ──────────────────────────────────────────────────────
     print("\n── Timing ──")
     print(f"  Wall clock (total):  {wall_clock:.2f}s")
-    print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'Total':>8}")
-    print(f"  {'-' * 69}")
+    print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'QA':>8} {'Total':>8}")
+    print(f"  {'-' * 77}")
     for m, pt in zip(all_metrics, parse_times, strict=True):
         print(
             f"  {m.filename:<25} {pt:>7.3f}s {m.hydrate_time:>8.3f}s "
-            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s {m.total_time:>7.3f}s"
+            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s "
+            f"{m.qa_time:>7.3f}s {m.total_time:>7.3f}s"
         )
 
     total_parse = sum(parse_times)
     total_hydrate = sum(m.hydrate_time for m in all_metrics)
     total_llm_time = sum(m.llm_fill_time for m in all_metrics)
     total_validate = sum(m.validate_time for m in all_metrics)
+    total_qa = sum(m.qa_time for m in all_metrics)
     sum_total = sum(m.total_time for m in all_metrics)
 
-    print(f"  {'-' * 69}")
+    print(f"  {'-' * 77}")
     print(
         f"  {'SUM':<25} {total_parse:>7.3f}s {total_hydrate:>8.3f}s "
-        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s {sum_total:>7.3f}s"
+        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s "
+        f"{total_qa:>7.3f}s {sum_total:>7.3f}s"
     )
 
     if sum_total > 0:

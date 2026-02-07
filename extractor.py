@@ -1,10 +1,11 @@
 """
-Product data extractor: programmatic hydration + LLM gap-fill.
+Product data extractor: programmatic hydration + LLM gap-fill + QA validation.
 
-Three stages:
+Four stages:
   A) Walk parsed structured data to fill Product fields (free)
   B) Call LLM only for missing fields — primarily category (cheap)
   C) Validate with Pydantic, retry category with taxonomy subset on failure
+  D) LLM QA validation — flag and correct discrepancies before output
 """
 
 import contextlib
@@ -108,6 +109,11 @@ class ExtractionMetrics:
     dom_variants_used: bool = False
     dom_sale_price_used: bool = False
     breadcrumb_source: str = ""  # json_ld, microdata, html_nav, none
+    # QA validation (Stage D)
+    qa_time: float = 0.0
+    qa_passed: bool = True
+    qa_issues: list[str] = field(default_factory=list)
+    qa_corrections_applied: int = 0
 
 
 # ===== LLM Response Schema =====
@@ -120,6 +126,33 @@ class LLMGapFill(BaseModel):
     description: str | None = None
     price: float | None = None
     currency: str | None = None
+
+
+class ImageVerdict(BaseModel):
+    """Per-image assessment from the vision model."""
+
+    index: int
+    keep: bool
+    color: str | None = None  # which color this image shows, if identifiable
+
+
+class QAResult(BaseModel):
+    """LLM QA validation output — vision-based."""
+
+    passed: bool
+    issues: list[str] = []
+    image_verdicts: list[ImageVerdict] = []
+    # Field corrections
+    name: str | None = None
+    brand: str | None = None
+    category: str | None = None
+    colors: list[str] | None = None
+    key_features: list[str] | None = None
+    has_duplicate_variants: bool = False
+
+
+# QA validation toggle
+QA_ENABLED = True
 
 
 # ===== Main Entry Point =====
@@ -184,7 +217,18 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
     else:
         metrics.category_resolution = "failed"
 
-    # Output richness
+    # Stage D: LLM QA validation (catch discrepancies)
+    t0 = time.monotonic()
+    product, qa_issues = await _qa_check(product, parsed)
+    metrics.qa_time = time.monotonic() - t0
+    metrics.qa_passed = len(qa_issues) == 0
+    metrics.qa_issues = qa_issues
+    if qa_issues:
+        metrics.llm_calls += 1
+        for issue in qa_issues:
+            logger.info(f"  QA: {issue}")
+
+    # Output richness (after QA corrections)
     metrics.num_variants = len(product.variants)
     metrics.num_images = len(product.image_urls)
     metrics.num_features = len(product.key_features)
@@ -319,6 +363,20 @@ def _looks_like_image_url_string(s: str) -> bool:
     if _SKIP_IMAGE_RE.search(s):
         return False
     return bool(re.search(r"\.(jpg|jpeg|png|webp|gif|avif)", s, re.IGNORECASE))
+
+
+def _looks_like_media_src(s: str) -> bool:
+    """Relaxed image URL check for media-lookup-resolved URLs.
+
+    Media lookup tables are a trusted source — the page's own structured data
+    mapping media IDs to src URLs. CDN image servers (e.g. Akamai) often serve
+    images without file extensions, so we only check for valid HTTP(S) and
+    skip obvious non-image patterns.
+    """
+    s = s.strip()
+    if not s.startswith(("http://", "https://", "//")):
+        return False
+    return not _SKIP_IMAGE_RE.search(s)
 
 
 def _extract_variant_image(value: Any) -> str | None:
@@ -583,6 +641,26 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
         fields["variants"] = _match_variant_images_by_color(
             fields["variants"], fields["image_urls"]
         )
+
+    # 8b. Resolve media IDs for variant images
+    if fields.get("variants") and parsed.media_lookups:
+        fields["variants"] = _resolve_variant_media_ids(
+            fields["variants"], parsed.embedded_json, parsed.media_lookups
+        )
+
+    # 8c. Inject active dimension values into variants
+    if fields.get("variants") and parsed.active_selections:
+        fields["variants"] = _inject_active_selections(
+            fields["variants"], parsed.active_selections
+        )
+
+    # 8d. Extract sibling variants and merge
+    sibling_variants = _extract_sibling_variants(
+        parsed.embedded_json, parsed.active_selections, parsed.page_url
+    )
+    if sibling_variants:
+        existing = fields.get("variants", [])
+        fields["variants"] = existing + sibling_variants
 
     # 9. DOM-based variant fallback (only when JSON variants not found)
     if not fields.get("variants") and parsed.dom_variants:
@@ -1600,7 +1678,7 @@ async def _retry_category(fields: dict, parsed: ParsedPage) -> str | None:
 def _collect_taxonomy_signals(fields: dict, parsed: ParsedPage) -> list[str]:
     """Collect product text signals for taxonomy classification.
 
-    Excludes brand (brand names like 'L.L.Bean' cause false matches in taxonomy).
+    Excludes brand (brand names can cause false matches in taxonomy).
     Skips last breadcrumb segment (usually the product name, not a category).
     """
     signals = []
@@ -1625,3 +1703,603 @@ def _set_defaults(fields: dict) -> None:
     fields.setdefault("video_url", None)
     fields.setdefault("image_urls", [])
     fields.setdefault("description", "")
+
+
+# =====================================================================
+# Step 8b: Media ID Resolution for Variant Images
+# =====================================================================
+
+# Keys on SKU/variant objects that reference media IDs
+_MEDIA_REF_KEYS = re.compile(r"(?i)^(mediaIds|media_ids|mediaId|imageIds|image_ids)$")
+
+
+def _resolve_variant_media_ids(
+    variants: list[Variant],
+    embedded_json: dict[str, Any],
+    media_lookups: list[list[dict]],
+) -> list[Variant]:
+    """Resolve media IDs on variants to actual image URLs.
+
+    When SKU objects have a mediaIds field referencing a media lookup table,
+    resolve the first matching ID to its src URL and assign to the variant.
+    """
+    if not media_lookups:
+        return variants
+
+    # Build unified lookup: media_id -> src_url
+    lookup: dict[str, str] = {}
+    for table in media_lookups:
+        for entry in table:
+            mid = entry.get("id", "")
+            src = entry.get("src", "")
+            if mid and src:
+                lookup[mid] = src
+
+    if not lookup:
+        return variants
+
+    # Build sku_id -> first_resolved_image_url
+    sku_image_map = _build_sku_media_map(embedded_json, lookup)
+    if not sku_image_map:
+        return variants
+
+    updated: list[Variant] = []
+    for v in variants:
+        if v.image_url is not None or not v.sku:
+            updated.append(v)
+            continue
+        img = sku_image_map.get(v.sku)
+        if img:
+            updated.append(v.model_copy(update={"image_url": img}))
+        else:
+            updated.append(v)
+
+    return updated
+
+
+def _build_sku_media_map(
+    embedded_json: dict[str, Any],
+    media_lookup: dict[str, str],
+) -> dict[str, str]:
+    """Build a mapping from SKU ID to resolved image URL.
+
+    Walks embedded JSON for SKU-like arrays where items have both an
+    ID field and a media-reference field (list of strings matching
+    media lookup IDs).
+    """
+    result: dict[str, str] = {}
+
+    def walk(data: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(data, list):
+            if len(data) >= 2 and isinstance(data[0], dict):
+                _try_resolve_sku_array(data, media_lookup, result)
+            for item in data:
+                walk(item, depth + 1)
+        elif isinstance(data, dict):
+            for v in data.values():
+                walk(v, depth + 1)
+
+    for _key, data in embedded_json.items():
+        walk(data)
+
+    return result
+
+
+def _try_resolve_sku_array(
+    arr: list[dict],
+    media_lookup: dict[str, str],
+    result: dict[str, str],
+) -> None:
+    """Check if array items have ID + media-reference fields, resolve them."""
+    sample = arr[0]
+
+    # Find the ID field
+    id_key = None
+    for k in sample:
+        if _VARIANT_SKU_KEYS.match(k):
+            id_key = k
+            break
+    if not id_key:
+        return
+
+    # Find the media reference field (list of strings matching lookup IDs)
+    media_ref_key = None
+    for k in sample:
+        if _MEDIA_REF_KEYS.match(k):
+            val = sample[k]
+            if (
+                isinstance(val, list)
+                and val
+                and isinstance(val[0], str)
+                and any(mid in media_lookup for mid in val[:5])
+            ):
+                media_ref_key = k
+                break
+    if not media_ref_key:
+        return
+
+    for item in arr:
+        sku_id = str(item.get(id_key, ""))
+        refs = item.get(media_ref_key, [])
+        if not sku_id or not isinstance(refs, list):
+            continue
+        for mid in refs:
+            if isinstance(mid, str) and mid in media_lookup:
+                src = media_lookup[mid]
+                # Relaxed check: media lookup URLs are from a trusted source
+                # (the page's own media table), so we don't require a file
+                # extension — Akamai/CDN image servers often omit them.
+                if _looks_like_media_src(src):
+                    result[sku_id] = ("https:" + src) if src.startswith("//") else src
+                    break
+
+
+# =====================================================================
+# Step 8c: Active Selection Injection into Variants
+# =====================================================================
+
+
+def _inject_active_selections(
+    variants: list[Variant],
+    active_selections: list[dict],
+) -> list[Variant]:
+    """Inject active dimension values into variants that are missing them.
+
+    When a page represents a specific value of some dimension (e.g., color="Iron"),
+    but extracted variants only have other dimensions (e.g., size), inject the
+    active dimension into each variant's attributes.
+    """
+    if not variants or not active_selections:
+        return variants
+
+    updated = list(variants)
+    for selection in active_selections:
+        dim = selection.get("dimension", "")
+        value = selection.get("value", "")
+        if not dim or not value:
+            continue
+
+        # Skip if this dimension already exists on >50% of variants
+        has_dim_count = sum(
+            1 for v in updated
+            if dim in {k.lower() for k in v.attributes}
+        )
+        if has_dim_count > len(updated) * 0.5:
+            continue
+
+        new_updated = []
+        for v in updated:
+            if dim not in {k.lower() for k in v.attributes}:
+                new_attrs = dict(v.attributes)
+                new_attrs[dim] = value
+                new_updated.append(v.model_copy(update={"attributes": new_attrs}))
+            else:
+                new_updated.append(v)
+        updated = new_updated
+
+    return updated
+
+
+# =====================================================================
+# Step 8d: Sibling Variant Extraction
+# =====================================================================
+
+# Label fields on sibling variant objects
+_SIBLING_LABEL_KEYS = re.compile(
+    r"(?i)^(colorDescription|color_description|variantName|variant_name|"
+    r"title|name|label|displayName)$"
+)
+# URL fields
+_SIBLING_URL_KEYS = re.compile(
+    r"(?i)^(pdpUrl|url|href|path|uri|link|productUrl|product_url)$"
+)
+# Image fields
+_SIBLING_IMAGE_KEYS = re.compile(
+    r"(?i)^(squarishImg|portraitImg|image|imageUrl|image_url|thumbnail|"
+    r"thumbnailUrl|swatch|swatchImage|img)$"
+)
+# SKU/ID fields
+_SIBLING_SKU_KEYS_RE = re.compile(
+    r"(?i)^(styleColor|style_color|sku|productId|product_id|variantId|variant_id)$"
+)
+# Swatch object fields (nested dimension value)
+_SIBLING_SWATCH_KEYS = re.compile(
+    r"(?i)^(color_swatch|colour_swatch|swatch|colorSwatch|finish_swatch|material_swatch)$"
+)
+# Array key names that hint at sibling variants
+_SIBLING_ARRAY_KEYS = re.compile(
+    r"(?i)(colorway|variant.?product|related.?variant|sibling|"
+    r"alternate.?color|other.?color|color.?option|colour.?option)"
+)
+# Dimension hint patterns for field names
+_SIBLING_DIMENSION_HINTS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?i)color|colour"), "color"),
+    (re.compile(r"(?i)finish"), "finish"),
+    (re.compile(r"(?i)material"), "material"),
+    (re.compile(r"(?i)pattern"), "pattern"),
+    (re.compile(r"(?i)style"), "style"),
+]
+
+
+def _extract_sibling_variants(
+    embedded_json: dict[str, Any],
+    active_selections: list[dict],
+    page_url: str,
+) -> list[Variant]:
+    """Extract sibling variants from embedded JSON arrays.
+
+    Sibling variants represent the same product in different dimension values
+    (e.g., different colorways). Each sibling has a label and optionally
+    a URL, image, and SKU.
+    """
+    candidates = _find_sibling_arrays(embedded_json)
+    if not candidates:
+        return []
+
+    # Pick the best candidate (most entries with richest fields)
+    best = max(candidates, key=lambda arr: len(arr) * _sibling_richness(arr[0]))
+
+    # Siblings must have varied labels — if all labels are the same,
+    # this is a media gallery or similar repeated structure, not variants
+    unique_labels = {_extract_sibling_label(item) for item in best[:20]} - {None}
+    if len(unique_labels) < 2:
+        return []
+
+    dimension = _infer_sibling_dimension(best)
+
+    # Build set of current-page values to exclude
+    current_values: set[str] = set()
+    for sel in active_selections:
+        current_values.add(sel["value"].lower())
+    if page_url:
+        current_values.add(page_url.lower())
+
+    variants: list[Variant] = []
+    for item in best:
+        label = _extract_sibling_label(item)
+        if not label:
+            continue
+
+        # Skip if this is the current page's variant
+        if _is_current_sibling(item, label, current_values, page_url):
+            continue
+
+        image = _extract_sibling_image(item)
+        sku = _extract_sibling_sku(item)
+
+        variants.append(Variant(
+            attributes={dimension: label},
+            sku=sku,
+            image_url=image,
+        ))
+
+    return variants
+
+
+def _find_sibling_arrays(
+    data: Any,
+    depth: int = 0,
+) -> list[list[dict]]:
+    """Find arrays of dicts that look like sibling variant lists."""
+    results: list[list[dict]] = []
+    if depth > 8:
+        return results
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if not isinstance(v, list) or len(v) < 2:
+                _find_sibling_arrays_recurse(v, results, depth)
+                continue
+            if not all(isinstance(item, dict) for item in v[:3]):
+                _find_sibling_arrays_recurse(v, results, depth)
+                continue
+            # Check by key name hint
+            if isinstance(k, str) and _SIBLING_ARRAY_KEYS.search(k) and _has_sibling_fields(v[0]):
+                results.append(v)
+                continue
+            # Check by field content
+            if _looks_like_sibling_array(v):
+                results.append(v)
+                continue
+            _find_sibling_arrays_recurse(v, results, depth)
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_find_sibling_arrays(item, depth + 1))
+    return results
+
+
+def _find_sibling_arrays_recurse(
+    data: Any,
+    results: list[list[dict]],
+    depth: int,
+) -> None:
+    """Helper to recurse into non-sibling values."""
+    if isinstance(data, (dict, list)):
+        results.extend(_find_sibling_arrays(data, depth + 1))
+
+
+def _looks_like_sibling_array(arr: list) -> bool:
+    """Check if array items look like sibling variant objects."""
+    if not arr or not isinstance(arr[0], dict):
+        return False
+    # Must have sibling-like fields but NOT be a regular variant array
+    if not _has_sibling_fields(arr[0]):
+        return False
+    return not _looks_like_variant_array(arr)
+
+
+def _has_sibling_fields(d: dict) -> bool:
+    """Check if a dict has the field pattern of a sibling variant.
+
+    Requires a label AND at least one product-specific indicator (image, SKU,
+    or swatch). A label + URL alone is too generic — navigation link arrays
+    also have {name, url} and would cause false positives.
+    """
+    keys = set(d.keys())
+    has_label = any(_SIBLING_LABEL_KEYS.match(k) for k in keys)
+    has_image = any(_SIBLING_IMAGE_KEYS.match(k) for k in keys)
+    has_sku = any(_SIBLING_SKU_KEYS_RE.match(k) for k in keys)
+    has_swatch = any(_SIBLING_SWATCH_KEYS.match(k) for k in keys)
+    return has_label and (has_image or has_sku or has_swatch)
+
+
+def _sibling_richness(d: dict) -> int:
+    """Score how rich a sibling dict is (more useful fields = better)."""
+    score = 0
+    for k in d:
+        if _SIBLING_LABEL_KEYS.match(k) or _SIBLING_IMAGE_KEYS.match(k):
+            score += 2
+        elif _SIBLING_SKU_KEYS_RE.match(k) or _SIBLING_SWATCH_KEYS.match(k):
+            score += 1
+    return score
+
+
+def _infer_sibling_dimension(arr: list[dict]) -> str:
+    """Infer the dimension name from sibling array field names."""
+    if not arr:
+        return "color"
+    sample = arr[0]
+    # Check field names for dimension hints
+    for k in sample:
+        for pattern, dim in _SIBLING_DIMENSION_HINTS:
+            if pattern.search(k):
+                return dim
+    # Check swatch objects
+    for k, _v in sample.items():
+        if _SIBLING_SWATCH_KEYS.match(k):
+            for pattern, dim in _SIBLING_DIMENSION_HINTS:
+                if pattern.search(k):
+                    return dim
+    return "color"
+
+
+def _extract_sibling_label(item: dict) -> str | None:
+    """Extract the human-readable label from a sibling dict."""
+    # Priority 1: swatch object with name
+    for k, v in item.items():
+        if _SIBLING_SWATCH_KEYS.match(k) and isinstance(v, dict):
+            name = v.get("name") or v.get("label") or v.get("title")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    # Priority 2: direct label fields
+    for k, v in item.items():
+        if _SIBLING_LABEL_KEYS.match(k) and isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _extract_sibling_image(item: dict) -> str | None:
+    """Extract an image URL from a sibling dict."""
+    for k, v in item.items():
+        if _SIBLING_IMAGE_KEYS.match(k) and isinstance(v, str) and _looks_like_image_url_string(v):
+            return ("https:" + v) if v.startswith("//") else v
+    return None
+
+
+def _extract_sibling_sku(item: dict) -> str | None:
+    """Extract a SKU/ID from a sibling dict."""
+    for k, v in item.items():
+        if _SIBLING_SKU_KEYS_RE.match(k) and isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _is_current_sibling(
+    item: dict,
+    label: str,
+    current_values: set[str],
+    page_url: str,
+) -> bool:
+    """Check if a sibling entry represents the current page."""
+    if label.lower() in current_values:
+        return True
+    # Check URL match
+    for k, v in item.items():
+        if _SIBLING_URL_KEYS.match(k) and isinstance(v, str):
+            if page_url and v.lower().rstrip("/") == page_url.lower().rstrip("/"):
+                return True
+            # Also check if URL slug is contained in page_url
+            if page_url and v.strip("/").lower() in page_url.lower():
+                return True
+    return False
+
+
+# =====================================================================
+# Stage D: Vision-based QA Validation
+# =====================================================================
+
+_QA_SYSTEM_PROMPT = (
+    "Product data QA validator with vision. You see extracted data AND the actual product images.\n\n"
+    "IMAGE INSPECTION (critical):\n"
+    "- For each numbered image, decide KEEP or REMOVE.\n"
+    "- KEEP: actual photo of THIS product (hero shots, detail shots, lifestyle with product visible, in-context shots).\n"
+    "- REMOVE: banners, icons, logos, size charts, shipping/return graphics, review photos, "
+    "UI elements, lifestyle shots where the product is NOT visible, cross-sell images of OTHER products, swatch thumbnails.\n"
+    "- For each KEPT image, identify which color variant it shows using the product's color list. "
+    "Set null if product has one color or color is ambiguous.\n\n"
+    "FIELD CHECKS:\n"
+    "- COLORS: Must be real color names. Flag hex codes, CSS values, SKU codes, 'Default', 'N/A', 'Choose a design'.\n"
+    "- KEY_FEATURES: Must be product-specific. Flag duplicates, nav text, disclaimers.\n"
+    "- VARIANTS: Flag if duplicate attribute combinations exist.\n"
+    "- NAME/BRAND/CATEGORY/PRICE: Flag only clear errors.\n\n"
+    "Return image_verdicts for EVERY image. Set passed=true only if no images removed and no field issues."
+)
+
+
+def _build_qa_content(product: Product, parsed: ParsedPage) -> list[dict]:
+    """Build multimodal content: product summary text + actual images for vision inspection."""
+    parts: list[str] = [
+        f"Product: {product.name}",
+        f"Brand: {product.brand}",
+        f"Price: {product.price.price} {product.price.currency}",
+    ]
+    if product.price.compare_at_price:
+        parts.append(f"Was: {product.price.compare_at_price}")
+    parts.append(f"Category: {product.category.name}")
+    parts.append(f"Colors: {product.colors}")
+    if product.key_features:
+        parts.append(f"Features: {'; '.join(product.key_features[:5])}")
+    parts.append(f"Variants: {len(product.variants)}")
+    for v in product.variants[:5]:
+        parts.append(f"  {v.attributes}")
+    if len(product.variants) > 5:
+        parts.append(f"  ...+{len(product.variants) - 5} more")
+
+    summary = "\n".join(parts)
+
+    # Build multimodal content blocks: text summary + numbered images
+    content: list[dict] = [
+        {"type": "input_text", "text": f"QA this product:\n\n{summary}\n\nImages ({len(product.image_urls)}):"},
+    ]
+    for i, url in enumerate(product.image_urls):
+        content.append({"type": "input_text", "text": f"[Image {i}]"})
+        content.append({"type": "input_image", "image_url": url})
+
+    return content
+
+
+def _apply_qa_corrections(product: Product, result: QAResult) -> tuple[Product, int]:
+    """Apply vision QA corrections. Returns (corrected product, num corrections applied)."""
+    updates: dict[str, object] = {}
+    applied = 0
+
+    # --- Image filtering and color-image mapping ---
+    if result.image_verdicts:
+        keep_indices: set[int] = set()
+        color_to_urls: dict[str, list[str]] = {}
+
+        for v in result.image_verdicts:
+            if 0 <= v.index < len(product.image_urls):
+                if v.keep:
+                    keep_indices.add(v.index)
+                    if v.color:
+                        color_to_urls.setdefault(v.color, []).append(product.image_urls[v.index])
+
+        # Only filter if the model actually removed some images
+        removed = len(product.image_urls) - len(keep_indices)
+        if removed > 0 and keep_indices:
+            updates["image_urls"] = [
+                url for i, url in enumerate(product.image_urls) if i in keep_indices
+            ]
+            applied += 1
+            logger.info(f"  QA removed {removed} non-product images, kept {len(keep_indices)}")
+
+        # Assign images to variants that have a color but no image
+        if color_to_urls and product.variants:
+            updated_variants = []
+            variants_updated = 0
+            for var in product.variants:
+                color_attr = var.attributes.get("color", "")
+                if color_attr and not var.image_url:
+                    # Find matching color in the map (case-insensitive)
+                    for color_name, urls in color_to_urls.items():
+                        if color_name.lower() == color_attr.lower() and urls:
+                            var = var.model_copy(update={"image_url": urls[0]})
+                            variants_updated += 1
+                            break
+                updated_variants.append(var)
+            if variants_updated > 0:
+                updates["variants"] = updated_variants
+                applied += 1
+                logger.info(f"  QA matched images to {variants_updated} variants")
+
+    # --- Field corrections ---
+    if result.name and result.name.strip() and result.name != product.name:
+        updates["name"] = result.name.strip()
+        applied += 1
+
+    if result.brand and result.brand.strip() and result.brand != product.brand:
+        updates["brand"] = result.brand.strip()
+        applied += 1
+
+    if result.category and result.category in VALID_CATEGORIES and result.category != product.category.name:
+        updates["category"] = Category(name=result.category)
+        applied += 1
+
+    if result.colors is not None:
+        clean = [c for c in result.colors if isinstance(c, str) and c.strip()]
+        if clean:
+            updates["colors"] = clean
+            applied += 1
+
+    if result.key_features is not None:
+        clean = [f for f in result.key_features if isinstance(f, str) and f.strip()]
+        if clean:
+            updates["key_features"] = clean
+            applied += 1
+
+    if result.has_duplicate_variants and product.variants:
+        seen: set[str] = set()
+        deduped: list[Variant] = []
+        for v in product.variants:
+            key = str(sorted(v.attributes.items()))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(v)
+        if len(deduped) < len(product.variants):
+            updates["variants"] = updated_variants if "variants" in updates else deduped
+            applied += 1
+
+    if not updates:
+        return product, 0
+
+    return product.model_copy(update=updates), applied
+
+
+async def _qa_check(product: Product, parsed: ParsedPage) -> tuple[Product, list[str]]:
+    """Run vision-based LLM QA on a fully-formed Product.
+
+    Sends actual product images to a multimodal model for inspection.
+    Returns (possibly corrected product, list of issue descriptions).
+    """
+    if not QA_ENABLED:
+        return product, []
+
+    try:
+        content = _build_qa_content(product, parsed)
+        result = await ai.responses(
+            model=LLM_MODEL,
+            input=[
+                {"role": "system", "content": _QA_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            text_format=QAResult,
+        )
+
+        issues = result.issues or []
+        # Count image removals as issues too
+        removed_count = sum(1 for v in result.image_verdicts if not v.keep)
+        if removed_count:
+            issues.append(f"Removed {removed_count} non-product images")
+
+        if result.passed and removed_count == 0:
+            return product, []
+
+        corrected, num_applied = _apply_qa_corrections(product, result)
+        logger.info(f"  QA applied {num_applied} corrections")
+        return corrected, issues
+
+    except Exception as e:
+        logger.warning(f"  QA check failed (skipping): {e}")
+        return product, []
