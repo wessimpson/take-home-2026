@@ -6,3 +6,6 @@ uv.lock
 
 # Generated output
 products.json
+
+# Take-home prompt (reference only, not for submission)
+PROMPT.md
