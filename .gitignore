@@ -6,3 +6,6 @@ uv.lock
 
 # Generated output
 products.json
+
+# Frontend
+bun.lockb
