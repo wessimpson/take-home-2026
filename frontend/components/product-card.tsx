@@ -54,7 +54,14 @@ export function ProductCard({
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {product.category}
-            {product.color_count > 0 && ` \u00B7 ${product.color_count} colors`}
+            {product.colors?.length > 0 && (
+              <span>
+                {" \u00B7 "}
+                {product.colors.slice(0, 3).join(", ")}
+                {product.colors.length > 3 &&
+                  ` +${product.colors.length - 3}`}
+              </span>
+            )}
           </p>
         </CardContent>
       </Card>

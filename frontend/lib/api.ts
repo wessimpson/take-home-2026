@@ -15,12 +15,19 @@ export interface ProductCard {
   category: string;
   color_count: number;
   variant_count: number;
+  colors: string[];
 }
 
 export interface Price {
   price: number;
   currency: string;
   compare_at_price: number | null;
+}
+
+export interface VisualVariant {
+  label: string;
+  slug: string;
+  image_urls: string[];
 }
 
 export interface Variant {
@@ -45,6 +52,7 @@ export interface ProductDetail {
   category_breadcrumbs: string[];
   colors: string[];
   variants: Variant[];
+  visual_variants: VisualVariant[];
 }
 
 // ---------------------------------------------------------------------------

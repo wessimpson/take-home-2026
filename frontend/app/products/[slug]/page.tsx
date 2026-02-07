@@ -9,11 +9,12 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import { Separator } from "@/components/ui/separator";
-import { ImageGallery } from "@/components/image-gallery";
+import { ProductDetailContent } from "@/components/product-detail-content";
 import { VariantTable } from "@/components/variant-table";
-import { getProduct, formatPrice } from "@/lib/api";
+import { getProduct } from "@/lib/api";
 
 type Params = Promise<{ slug: string }>;
+type SearchParams = Promise<{ v?: string }>;
 
 export async function generateMetadata({
   params,
@@ -31,14 +32,15 @@ export async function generateMetadata({
 
 export default async function ProductPage({
   params,
+  searchParams,
 }: {
   params: Params;
+  searchParams: SearchParams;
 }) {
   const { slug } = await params;
+  const { v } = await searchParams;
   const product = await getProduct(slug);
   if (!product) notFound();
-
-  const hasSale = product.price.compare_at_price != null;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
@@ -73,86 +75,8 @@ export default async function ProductPage({
         </Breadcrumb>
       )}
 
-      {/* Two-column layout */}
-      <div className="grid gap-8 md:grid-cols-2 lg:gap-12">
-        {/* Left: Image gallery */}
-        <ImageGallery
-          images={product.image_urls}
-          alt={product.name}
-          videoUrl={product.video_url}
-        />
-
-        {/* Right: Product info */}
-        <div className="space-y-6">
-          <div>
-            <p className="text-sm tracking-wide text-muted-foreground uppercase">
-              {product.brand}
-            </p>
-            <h1 className="mt-1 text-2xl font-bold tracking-tight lg:text-3xl">
-              {product.name}
-            </h1>
-          </div>
-
-          {/* Price */}
-          <div className="flex items-baseline gap-3">
-            <span className="text-2xl font-semibold">
-              {formatPrice(product.price.price, product.price.currency)}
-            </span>
-            {hasSale && (
-              <span className="text-lg text-muted-foreground line-through">
-                {formatPrice(
-                  product.price.compare_at_price!,
-                  product.price.currency
-                )}
-              </span>
-            )}
-          </div>
-
-          {/* Colors */}
-          {product.colors.length > 0 && (
-            <div>
-              <h3 className="mb-2 text-sm font-medium">Colors</h3>
-              <div className="flex flex-wrap gap-2">
-                {product.colors.map((color) => (
-                  <span
-                    key={color}
-                    className="rounded-full border px-3 py-1 text-xs"
-                  >
-                    {color}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <Separator />
-
-          {/* Description */}
-          {product.description && (
-            <div>
-              <h3 className="mb-2 text-sm font-medium">Description</h3>
-              <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-line">
-                {product.description}
-              </p>
-            </div>
-          )}
-
-          {/* Key Features */}
-          {product.key_features.length > 0 && (
-            <div>
-              <h3 className="mb-2 text-sm font-medium">Key Features</h3>
-              <ul className="space-y-1 text-sm text-muted-foreground">
-                {product.key_features.map((feature, i) => (
-                  <li key={i} className="flex gap-2">
-                    <span className="mt-1.5 h-1 w-1 flex-shrink-0 rounded-full bg-muted-foreground" />
-                    {feature}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      </div>
+      {/* Two-column layout with visual variant support */}
+      <ProductDetailContent product={product} initialVariantSlug={v} />
 
       {/* Variants section */}
       {product.variants.length > 0 && (
