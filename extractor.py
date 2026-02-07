@@ -101,6 +101,13 @@ class ExtractionMetrics:
     num_colors: int = 0
     has_video: bool = False
     has_sale_price: bool = False
+    # Platform-aware extraction
+    platform_detected: str = ""
+    js_framework_detected: str = ""
+    platform_extraction_used: bool = False
+    dom_variants_used: bool = False
+    dom_sale_price_used: bool = False
+    breadcrumb_source: str = ""  # json_ld, microdata, html_nav, none
 
 
 # ===== LLM Response Schema =====
@@ -121,12 +128,19 @@ class LLMGapFill(BaseModel):
 async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, ExtractionMetrics]:
     """Full extraction pipeline: hydrate -> LLM fill -> validate. Returns product and metrics."""
     metrics = ExtractionMetrics(filename=filename)
+    metrics.platform_detected = parsed.platform
+    metrics.js_framework_detected = parsed.js_framework
     t_start = time.monotonic()
 
     # Stage A: Programmatic hydration (free)
     t0 = time.monotonic()
     fields = _hydrate_fields(parsed)
     metrics.hydrate_time = time.monotonic() - t0
+
+    # Record platform-aware extraction flags
+    metrics.platform_extraction_used = fields.pop("_platform_extraction_used", False)
+    metrics.dom_variants_used = fields.pop("_dom_variants_used", False)
+    metrics.dom_sale_price_used = fields.pop("_dom_sale_price_used", False)
 
     # Record what parsing alone filled
     for f in PRODUCT_FIELDS:
@@ -205,7 +219,7 @@ _PRICE_KEY_RE = re.compile(
 )
 _CURRENCY_KEY_RE = re.compile(r"(?i)^(currency|priceCurrency|currencyCode)$")
 _COMPARE_PRICE_KEY_RE = re.compile(r"(?i)(compare|original|msrp|was|fullPrice|retail|initial|before|listPrice)")
-_SKIP_IMAGE_RE = re.compile(r"(?i)(favicon|logo|pixel|tracking|analytics|1x1|spacer|icon\b|\.svg)")
+_SKIP_IMAGE_RE = re.compile(r"(?i)(favicon|logo|pixel|tracking|analytics|1x1|spacer|icon\b|\.svg|flyout)")
 _VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:mp4|webm|m3u8)", re.IGNORECASE)
 
 # Variant detection
@@ -214,6 +228,9 @@ _VARIANT_GTIN_KEYS = re.compile(r"(?i)^(gtin|ean|upc|barcode|isbn)$")
 _VARIANT_SIZE_KEYS = re.compile(r"(?i)^(size|label|dimension)$")
 _VARIANT_COLOR_KEYS = re.compile(r"(?i)^(color|colour)$")
 _VARIANT_AVAIL_KEYS = re.compile(r"(?i)^(status|available|availability|stock|instock)$")
+_VARIANT_IMAGE_KEYS = re.compile(
+    r"(?i)^(image|featured_image|image_url|imageUrl|img|photo|thumbnail)$"
+)
 _VARIANT_SIGNAL_KEYS = {
     "size",
     "sku",
@@ -259,12 +276,24 @@ def _find_values_by_key_pattern(
     return results
 
 
+# Keys that indicate related/recommended product arrays (skip during image collection)
+_RELATED_PRODUCTS_KEY_RE = re.compile(
+    r"(?i)(related|recommend|similar|cross.?sell|also.?like|suggested|complementary|"
+    r"frequently.?bought|upsell|you.?may|sponsored|recently.?viewed)"
+)
+
+
 def _collect_image_urls_recursive(
     data: Any,
     depth: int = 0,
     max_depth: int = 10,
+    skip_related_keys: bool = False,
 ) -> list[str]:
-    """Recursively collect all string values that look like image URLs."""
+    """Recursively collect all string values that look like image URLs.
+
+    When skip_related_keys is True, skips dict entries whose key matches
+    related/recommended product patterns to prevent cross-product contamination.
+    """
     if depth > max_depth:
         return []
     urls = []
@@ -272,11 +301,13 @@ def _collect_image_urls_recursive(
         if _looks_like_image_url_string(data):
             urls.append(data)
     elif isinstance(data, dict):
-        for v in data.values():
-            urls.extend(_collect_image_urls_recursive(v, depth + 1, max_depth))
+        for k, v in data.items():
+            if skip_related_keys and isinstance(k, str) and _RELATED_PRODUCTS_KEY_RE.search(k):
+                continue
+            urls.extend(_collect_image_urls_recursive(v, depth + 1, max_depth, skip_related_keys))
     elif isinstance(data, list):
         for item in data:
-            urls.extend(_collect_image_urls_recursive(item, depth + 1, max_depth))
+            urls.extend(_collect_image_urls_recursive(item, depth + 1, max_depth, skip_related_keys))
     return urls
 
 
@@ -288,6 +319,19 @@ def _looks_like_image_url_string(s: str) -> bool:
     if _SKIP_IMAGE_RE.search(s):
         return False
     return bool(re.search(r"\.(jpg|jpeg|png|webp|gif|avif)", s, re.IGNORECASE))
+
+
+def _extract_variant_image(value: Any) -> str | None:
+    """Extract a single image URL from a variant's image field value."""
+    if isinstance(value, str) and _looks_like_image_url_string(value):
+        return ("https:" + value) if value.startswith("//") else value
+    if isinstance(value, dict):
+        src = value.get("src") or value.get("url")
+        if isinstance(src, str) and _looks_like_image_url_string(src):
+            return ("https:" + src) if src.startswith("//") else src
+    if isinstance(value, list) and value:
+        return _extract_variant_image(value[0])
+    return None
 
 
 def _collect_video_urls_recursive(
@@ -383,6 +427,47 @@ def _looks_like_variant_array(arr: list) -> bool:
     return True
 
 
+def _match_variant_images_by_color(
+    variants: list[Variant], image_urls: list[str]
+) -> list[Variant]:
+    """Fallback: match product-level images to color variants by URL substring."""
+    if not image_urls:
+        return variants
+
+    updated = []
+    for variant in variants:
+        if variant.image_url is not None:
+            updated.append(variant)
+            continue
+
+        color = variant.attributes.get("color", "").strip()
+        if not color:
+            updated.append(variant)
+            continue
+
+        # Normalize: "Jet Black" -> "jet-black" / "jet_black" / "jetblack"
+        color_lower = color.lower()
+        slugs = [
+            re.sub(r"[^a-z0-9]+", "-", color_lower).strip("-"),
+            re.sub(r"[^a-z0-9]+", "_", color_lower).strip("_"),
+            re.sub(r"[^a-z0-9]", "", color_lower),
+        ]
+
+        match = None
+        for url in image_urls:
+            path = url.split("?")[0].lower()
+            if any(s and s in path for s in slugs):
+                match = url
+                break
+
+        if match:
+            updated.append(variant.model_copy(update={"image_url": match}))
+        else:
+            updated.append(variant)
+
+    return updated
+
+
 def _normalize_and_dedup_urls(urls: list[str]) -> list[str]:
     """Normalize URLs and remove duplicates while preserving order."""
     result: list[str] = []
@@ -426,7 +511,18 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
     """Walk all data sources in priority order to fill Product fields."""
     fields: dict[str, Any] = {}
 
-    # 1. Embedded JSON (richest source for most pages)
+    # 0. Platform-specific targeted extraction (highest priority)
+    platform_obj = None
+    if parsed.platform == "shopify":
+        platform_obj = _extract_shopify_product(parsed)
+    elif parsed.js_framework == "next.js":
+        platform_obj = _extract_nextjs_product(parsed)
+
+    if platform_obj:
+        _extract_fields_from_object(platform_obj, fields)
+        fields["_platform_extraction_used"] = True
+
+    # 1. Embedded JSON (richest source for most pages — fills gaps from step 0)
     for _source_name, data in parsed.embedded_json.items():
         product_obj = _find_product_object(data)
         if product_obj:
@@ -448,8 +544,11 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
 
     # 5b. Broad image sweep from embedded JSON (catches __NEXT_DATA__, etc.)
     # Merges with any images already found, placing high-res JSON URLs first.
+    # Uses skip_related_keys to avoid collecting images from related/recommended products.
     for _source_name, data in parsed.embedded_json.items():
-        broad_urls = _normalize_and_dedup_urls(_collect_image_urls_recursive(data))
+        broad_urls = _normalize_and_dedup_urls(
+            _collect_image_urls_recursive(data, skip_related_keys=True)
+        )
         if len(broad_urls) > len(fields.get("image_urls", [])):
             existing = fields.get("image_urls", [])
             # Prepend broad sweep URLs, then append any existing URLs not already present
@@ -479,7 +578,114 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
         cat_crumbs = parsed.breadcrumbs[:-1] if len(parsed.breadcrumbs) > 1 else parsed.breadcrumbs
         fields.setdefault("_category_hints", []).append(" > ".join(cat_crumbs))
 
+    # 8. Match product-level images to color variants by URL heuristic
+    if fields.get("variants") and fields.get("image_urls"):
+        fields["variants"] = _match_variant_images_by_color(
+            fields["variants"], fields["image_urls"]
+        )
+
+    # 9. DOM-based variant fallback (only when JSON variants not found)
+    if not fields.get("variants") and parsed.dom_variants:
+        variants = _build_variants_from_dom(parsed.dom_variants)
+        if variants:
+            fields["variants"] = variants
+            fields["_dom_variants_used"] = True
+
+    # 9b. DOM-based color fallback
+    if not fields.get("colors") and parsed.dom_variants:
+        for sig in parsed.dom_variants:
+            if sig["type"] == "color" and sig["values"]:
+                fields["colors"] = sig["values"]
+                break
+
+    # 10. DOM-based sale price enrichment
+    if parsed.dom_sale_price.get("has_sale"):
+        dom_sale = parsed.dom_sale_price
+        if "price" in fields and isinstance(fields["price"], Price):
+            if fields["price"].compare_at_price is None and dom_sale.get("original_price"):
+                original = dom_sale["original_price"]
+                if original > fields["price"].price:
+                    fields["price"] = Price(
+                        price=fields["price"].price,
+                        currency=fields["price"].currency,
+                        compare_at_price=original,
+                    )
+                    fields["_dom_sale_price_used"] = True
+        elif "price" not in fields and dom_sale.get("sale_price") and dom_sale.get("original_price"):
+            fields["price"] = Price(
+                price=dom_sale["sale_price"],
+                currency="USD",
+                compare_at_price=dom_sale["original_price"],
+            )
+            fields["_dom_sale_price_used"] = True
+
     return fields
+
+
+# ----- Platform-Specific Extractors -----
+
+
+def _extract_shopify_product(parsed: ParsedPage) -> dict | None:
+    """Targeted extraction for Shopify pages.
+
+    Shopify stores product data in ProductJson-* script tags or analytics tracking.
+    """
+    # Priority 1: ProductJson-* script tag (most complete source)
+    for key, data in parsed.embedded_json.items():
+        if key.startswith("ProductJson") and isinstance(data, dict):
+            return data
+
+    # Priority 2: Analytics tracking product
+    tracked = parsed.embedded_json.get("_analytics_tracked_product")
+    if isinstance(tracked, dict) and tracked.get("name"):
+        return tracked
+
+    return None
+
+
+def _extract_nextjs_product(parsed: ParsedPage) -> dict | None:
+    """Targeted extraction for Next.js pages.
+
+    Navigate directly to __NEXT_DATA__.props.pageProps instead of generic walking.
+    """
+    next_data = parsed.embedded_json.get("__NEXT_DATA__")
+    if not isinstance(next_data, dict):
+        return None
+
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    if not page_props:
+        return None
+
+    return _find_product_object(page_props)
+
+
+def _build_variants_from_dom(dom_signals: list[dict]) -> list[Variant]:
+    """Build Variant objects from DOM-detected size/color options.
+
+    Lower fidelity than JSON-based variants (no SKU/GTIN/price/availability).
+    Only used when JSON sources find nothing.
+    """
+    sizes: list[str] = []
+    colors: list[str] = []
+    for sig in dom_signals:
+        if sig["type"] == "size" and not sizes:
+            sizes = sig["values"]
+        elif sig["type"] == "color" and not colors:
+            colors = sig["values"]
+
+    variants: list[Variant] = []
+    if sizes and colors:
+        for size in sizes:
+            for color in colors:
+                variants.append(Variant(attributes={"size": size, "color": color}))
+    elif sizes:
+        for size in sizes:
+            variants.append(Variant(attributes={"size": size}))
+    elif colors:
+        for color in colors:
+            variants.append(Variant(attributes={"color": color}))
+
+    return variants
 
 
 # ----- Product Object Finder -----
@@ -687,8 +893,8 @@ def _extract_images_from_obj(obj: dict, fields: dict) -> None:
             if isinstance(m, dict) and m.get("src"):
                 urls.append(m["src"])
 
-    # Recursive collection from all nested data
-    recursive_urls = _collect_image_urls_recursive(obj)
+    # Recursive collection from nested data (skip related/recommended product sections)
+    recursive_urls = _collect_image_urls_recursive(obj, skip_related_keys=True)
     urls.extend(recursive_urls)
 
     normalized = _normalize_and_dedup_urls(urls)
@@ -822,6 +1028,9 @@ def _extract_variants(obj: dict, fields: dict) -> None:
                 attrs["size"] = str(name)
             sku = item.get("sku") or item.get("item")
             ean = item.get("ean") or item.get("upc")
+            img = _extract_variant_image(
+                item.get("image") or item.get("imageUrl") or item.get("featured_image")
+            )
             stock = item.get("stock")
             available = True
             if isinstance(stock, (int, float)):
@@ -834,6 +1043,7 @@ def _extract_variants(obj: dict, fields: dict) -> None:
                     attributes=attrs,
                     sku=str(sku) if sku else None,
                     gtin=str(ean) if ean else None,
+                    image_url=img,
                     available=available,
                 )
             )
@@ -860,6 +1070,7 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
         attrs: dict[str, str] = {}
         sku = None
         gtin = None
+        image_url = None
         available = True
 
         for k, v in item.items():
@@ -891,6 +1102,8 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
                 elif isinstance(v, dict):
                     status = str(v.get("status", "")).upper()
                     available = status not in ("OUT_OF_STOCK", "UNAVAILABLE")
+            elif _VARIANT_IMAGE_KEYS.match(k) and image_url is None:
+                image_url = _extract_variant_image(v)
 
         if not attrs:
             name = item.get("name")
@@ -903,6 +1116,7 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
                     attributes=attrs,
                     sku=sku,
                     gtin=gtin,
+                    image_url=image_url,
                     available=available,
                 )
             )
@@ -945,6 +1159,10 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
         if not attrs:
             continue
 
+        image_url = _extract_variant_image(
+            sku.get("image") or sku.get("imageUrl")
+        )
+
         availability = sku.get("availability", {})
         available = True
         if isinstance(availability, dict):
@@ -955,6 +1173,7 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
             Variant(
                 attributes=attrs,
                 sku=sku_id,
+                image_url=image_url,
                 available=available,
             )
         )
@@ -1073,12 +1292,14 @@ def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
                         price=float(v_offers["price"]),
                         currency=v_offers.get("priceCurrency", "USD"),
                     )
+                v_image = _extract_variant_image(v.get("image"))
                 variants.append(
                     Variant(
                         attributes=attrs,
                         sku=v.get("mpn"),
                         gtin=v.get("gtin"),
                         price=v_price,
+                        image_url=v_image,
                     )
                 )
             if variants:

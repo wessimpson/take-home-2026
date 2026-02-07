@@ -40,7 +40,8 @@ async def process_file(filepath: Path) -> tuple[Product, ExtractionMetrics, floa
         f"{len(parsed.og_tags)} OG tags, "
         f"{len(parsed.embedded_json)} embedded JSON, "
         f"{len(parsed.image_urls)} images, "
-        f"{len(parsed.video_urls)} videos"
+        f"{len(parsed.video_urls)} videos | "
+        f"platform={parsed.platform}, framework={parsed.js_framework}"
     )
 
     # Step 2-4: Extract, fill gaps with LLM, validate
@@ -116,6 +117,24 @@ def print_report(
     if not all_metrics:
         print("\n  No successful extractions to report on.")
         return
+
+    # ── Platform Detection ──────────────────────────────────────────
+    print("\n── Platform Detection ──")
+    from collections import Counter
+
+    platforms = Counter(m.platform_detected for m in all_metrics)
+    frameworks = Counter(m.js_framework_detected for m in all_metrics)
+    for platform, count in platforms.most_common():
+        used = sum(1 for m in all_metrics if m.platform_detected == platform and m.platform_extraction_used)
+        print(f"  {platform:<25} {count:>3} pages, {used:>3} used targeted extraction")
+    print()
+    for fw, count in frameworks.most_common():
+        print(f"  {fw:<25} {count:>3} pages")
+
+    dom_vars = sum(1 for m in all_metrics if m.dom_variants_used)
+    dom_sale = sum(1 for m in all_metrics if m.dom_sale_price_used)
+    print(f"\n  DOM variant fallback used:     {dom_vars}/{n}")
+    print(f"  DOM sale price enrichment:     {dom_sale}/{n}")
 
     # ── Parser vs LLM (cost lever) ──────────────────────────────────
     print("\n── Parser vs LLM (free vs paid) ──")
