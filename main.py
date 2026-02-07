@@ -263,6 +263,9 @@ async def main() -> None:
         print(f"    Features: {len(p.key_features)} items")
         print(f"    Images:   {len(p.image_urls)} URLs")
         print(f"    Variants: {len(p.variants)} configurations")
+        if p.variant_dimensions:
+            dims = ", ".join(f"{d.name}({len(d.values)})" for d in p.variant_dimensions)
+            print(f"    Dimensions: {dims}")
         print(f"    Colors:   {p.colors}")
         if p.video_url:
             print(f"    Video:    {p.video_url}")
