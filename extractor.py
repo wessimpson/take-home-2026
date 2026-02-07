@@ -446,6 +446,21 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
     # 5. Look for colors across all embedded JSON data
     _extract_colors_from_all_data(parsed.embedded_json, fields)
 
+    # 5b. Broad image sweep from embedded JSON (catches __NEXT_DATA__, etc.)
+    # Merges with any images already found, placing high-res JSON URLs first.
+    for _source_name, data in parsed.embedded_json.items():
+        broad_urls = _normalize_and_dedup_urls(_collect_image_urls_recursive(data))
+        if len(broad_urls) > len(fields.get("image_urls", [])):
+            existing = fields.get("image_urls", [])
+            # Prepend broad sweep URLs, then append any existing URLs not already present
+            merged = list(broad_urls)
+            seen = set(merged)
+            for url in existing:
+                if url not in seen:
+                    merged.append(url)
+                    seen.add(url)
+            fields["image_urls"] = merged
+
     # 6. Collected image/video URLs from parser as final fallback
     if "image_urls" not in fields or not fields["image_urls"]:
         fields["image_urls"] = parsed.image_urls

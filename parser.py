@@ -287,9 +287,21 @@ def _extract_body_text(soup: BeautifulSoup) -> str:
 
 
 def _extract_image_urls(soup: BeautifulSoup) -> list[str]:
-    """Extract all image URLs from <img> tags (src and data-src)."""
+    """Extract all image URLs from <img> tags.
+
+    Checks srcset/data-srcset first (preferring the highest-resolution variant),
+    then falls back to src/data-src.
+    """
     urls: list[str] = []
     for img in soup.find_all("img"):
+        # Prefer the highest-resolution URL from srcset when available
+        best_srcset = _best_from_srcset(img.get("srcset") or img.get("data-srcset"))
+        if best_srcset:
+            best_srcset = _normalize_url(best_srcset)
+            if best_srcset and _looks_like_image_url(best_srcset):
+                urls.append(best_srcset)
+                continue  # srcset found a good URL, skip src/data-src for this tag
+
         for attr in ("src", "data-src"):
             url = img.get(attr)
             if url and isinstance(url, str):
@@ -297,6 +309,47 @@ def _extract_image_urls(soup: BeautifulSoup) -> list[str]:
                 if url and _looks_like_image_url(url):
                     urls.append(url)
     return list(dict.fromkeys(urls))  # deduplicate preserving order
+
+
+def _best_from_srcset(srcset: str | None) -> str | None:
+    """Parse an srcset attribute and return the highest-resolution URL.
+
+    Handles both width descriptors (e.g. '800w') and pixel-density
+    descriptors (e.g. '2x').  Falls back to the last entry when no
+    descriptor is present.
+    """
+    if not srcset or not isinstance(srcset, str):
+        return None
+
+    best_url: str | None = None
+    best_value: float = 0
+
+    for entry in srcset.split(","):
+        parts = entry.strip().split()
+        if not parts:
+            continue
+        url = parts[0]
+        if not url:
+            continue
+
+        if len(parts) >= 2:
+            descriptor = parts[-1].strip().lower()
+            try:
+                if descriptor.endswith("w") or descriptor.endswith("x"):
+                    value = float(descriptor[:-1])
+                else:
+                    value = 0
+            except ValueError:
+                value = 0
+        else:
+            # No descriptor — treat as a single candidate
+            value = 1
+
+        if value >= best_value:
+            best_url = url
+            best_value = value
+
+    return best_url
 
 
 def _normalize_url(url: str) -> str:
