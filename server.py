@@ -76,6 +76,11 @@ def _slugify(text: str) -> str:
 # Image curation
 # ---------------------------------------------------------------------------
 
+# Leading numeric product-ID prefix to strip for secondary dedup.
+# Catches patterns like "224626_1176_41" vs "224625_1176_41" where the
+# leading segment is a product/SKU ID and the rest identifies color+view.
+_LEADING_ID_PREFIX = re.compile(r"^\d+[_-](?=\d)")
+
 # Common CDN size/transform suffixes to strip when deduplicating
 _SIZE_SUFFIXES = re.compile(
     r"[-_](mini|thumb|thumbnail|square|small|medium|large|full|max|"
@@ -149,19 +154,12 @@ def _suffix_quality_score(filename: str) -> int:
 # CDN URL upgrades — request the highest-resolution variant available
 # ---------------------------------------------------------------------------
 
-# Nike/Cloudinary: named transform in URL path  e.g. /t_default/ or /t_PDP_144_v1/
-_CLOUDINARY_TRANSFORM = re.compile(r"/t_[A-Za-z0-9_]+/")
-
-# Akamai Image Server: ?wid=NNN query param (L.L.Bean, etc.)
+# Akamai Image Server: ?wid=NNN query param
 _AKAMAI_WID = re.compile(r"([?&])wid=\d+")
 
 
 def _upgrade_cdn_url(url: str) -> str:
     """Upgrade a CDN image URL to request the highest available resolution."""
-    # Nike / Cloudinary named transforms → largest PDP size
-    if "static.nike.com" in url and _CLOUDINARY_TRANSFORM.search(url):
-        return _CLOUDINARY_TRANSFORM.sub("/t_PDP_1728_v1/", url)
-
     # Akamai Image Server → request large width
     if "/is/image/" in url:
         if _AKAMAI_WID.search(url):
@@ -177,11 +175,17 @@ def _curate_images(image_urls: list[str], max_images: int = 12) -> list[str]:
 
     When multiple URLs map to the same base filename (e.g. image-full.jpg and
     image-mini.jpg), the URL with the highest quality suffix wins.
+
+    A secondary dedup pass strips leading numeric product-ID prefixes so that
+    URLs like ``224626_1176_41`` and ``224625_1176_41`` (same image from
+    different SKU variants) are treated as duplicates.
     """
     # base -> (url, quality_score)
     best_for_base: dict[str, tuple[str, int]] = {}
     # Track insertion order of first-seen bases
     base_order: list[str] = []
+    # Secondary dedup: tail key (leading product-ID stripped) → first base
+    tail_seen: dict[str, str] = {}
 
     for url in image_urls:
         if not _is_likely_product_image(url):
@@ -192,9 +196,20 @@ def _curate_images(image_urls: list[str], max_images: int = 12) -> list[str]:
         base = _SIZE_SUFFIXES.sub("", filename).lower()
         score = _suffix_quality_score(filename)
 
+        # Secondary key: strip leading product-ID prefix for cross-SKU dedup
+        tail = _LEADING_ID_PREFIX.sub("", base)
+        if tail != base and tail in tail_seen:
+            # Already seen an image with the same tail — treat as duplicate
+            existing_base = tail_seen[tail]
+            if existing_base in best_for_base and score > best_for_base[existing_base][1]:
+                best_for_base[existing_base] = (url, score)
+            continue
+
         if base not in best_for_base:
             best_for_base[base] = (url, score)
             base_order.append(base)
+            if tail != base:
+                tail_seen[tail] = base
         elif score > best_for_base[base][1]:
             best_for_base[base] = (url, score)
 
