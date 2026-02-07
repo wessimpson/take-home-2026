@@ -9,3 +9,11 @@ products.json
 
 # Frontend
 bun.lockb
+
+# Validation & analysis data
+data/validation-data/
+data/analysis-data/
+analysis/
+
+# Playwright MCP
+.playwright-mcp/
