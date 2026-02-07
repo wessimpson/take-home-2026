@@ -190,7 +190,9 @@ class TaxonomyTree:
                 self._path_to_node[cat_path] = node
                 self._lower_to_path[cat_path.lower()] = cat_path
 
-        # Build leaf name index (all 5,595 leaf names are unique)
+        # Build name-to-path index.
+        # Index leaf nodes first (highest priority), then non-leaf valid
+        # categories when their name is unambiguous (maps to exactly one path).
         for cat_path, node in self._path_to_node.items():
             if not node.children:  # true leaf
                 node.is_leaf = True
@@ -200,6 +202,22 @@ class TaxonomyTree:
                 stemmed_leaf = " ".join(_tokenize(node.name))
                 if stemmed_leaf and stemmed_leaf != leaf_name:
                     self._leaf_name_to_path[stemmed_leaf] = cat_path
+
+        # Index non-leaf valid categories by their last segment name.
+        # Only add if the name doesn't conflict with an existing leaf entry.
+        # E.g., "Lighting" → "Home & Garden > Lighting" (non-leaf but valid).
+        ambiguous = object()  # sentinel for names mapping to multiple paths
+        nonleaf_names: dict[str, str | object] = {}
+        for cat_path, node in self._path_to_node.items():
+            if node.children and cat_path in VALID_CATEGORIES:
+                name_lower = node.name.lower()
+                if name_lower in nonleaf_names:
+                    nonleaf_names[name_lower] = ambiguous
+                else:
+                    nonleaf_names[name_lower] = cat_path
+        for name_lower, cat_path in nonleaf_names.items():
+            if cat_path is not ambiguous and name_lower not in self._leaf_name_to_path:
+                self._leaf_name_to_path[name_lower] = cat_path
 
     def _propagate_subtree_tokens(self) -> None:
         """Bottom-up propagation: each node's subtree_tokens = union of all descendant tokens."""

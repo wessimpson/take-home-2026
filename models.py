@@ -128,6 +128,18 @@ class Variant(BaseModel):
         return v
 
 
+class VisualVariant(BaseModel):
+    """A visually distinct version of a product (e.g., a specific color).
+
+    Built at serve time by matching product images to color names via URL patterns.
+    Each visual variant gets its own curated image gallery.
+    """
+
+    label: str  # Human-readable: "Iron", "Navy Blue"
+    slug: str  # URL-safe: "iron", "navy-blue"
+    image_urls: list[str]  # Curated images for this color
+
+
 # This is the final product schema that you need to output.
 # You may add additional models as needed.
 class Product(BaseModel):

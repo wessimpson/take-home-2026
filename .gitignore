@@ -7,5 +7,16 @@ uv.lock
 # Generated output
 products.json
 
+# Frontend
+bun.lockb
+
+# Validation & analysis data
+data/validation-data/
+data/analysis-data/
+analysis/
+
+# Playwright MCP
+.playwright-mcp/
+
 # Take-home prompt (reference only, not for submission)
 PROMPT.md

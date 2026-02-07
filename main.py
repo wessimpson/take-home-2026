@@ -40,7 +40,8 @@ async def process_file(filepath: Path) -> tuple[Product, ExtractionMetrics, floa
         f"{len(parsed.og_tags)} OG tags, "
         f"{len(parsed.embedded_json)} embedded JSON, "
         f"{len(parsed.image_urls)} images, "
-        f"{len(parsed.video_urls)} videos"
+        f"{len(parsed.video_urls)} videos | "
+        f"platform={parsed.platform}, framework={parsed.js_framework}"
     )
 
     # Step 2-4: Extract, fill gaps with LLM, validate
@@ -117,6 +118,24 @@ def print_report(
         print("\n  No successful extractions to report on.")
         return
 
+    # ── Platform Detection ──────────────────────────────────────────
+    print("\n── Platform Detection ──")
+    from collections import Counter
+
+    platforms = Counter(m.platform_detected for m in all_metrics)
+    frameworks = Counter(m.js_framework_detected for m in all_metrics)
+    for platform, count in platforms.most_common():
+        used = sum(1 for m in all_metrics if m.platform_detected == platform and m.platform_extraction_used)
+        print(f"  {platform:<25} {count:>3} pages, {used:>3} used targeted extraction")
+    print()
+    for fw, count in frameworks.most_common():
+        print(f"  {fw:<25} {count:>3} pages")
+
+    dom_vars = sum(1 for m in all_metrics if m.dom_variants_used)
+    dom_sale = sum(1 for m in all_metrics if m.dom_sale_price_used)
+    print(f"\n  DOM variant fallback used:     {dom_vars}/{n}")
+    print(f"  DOM sale price enrichment:     {dom_sale}/{n}")
+
     # ── Parser vs LLM (cost lever) ──────────────────────────────────
     print("\n── Parser vs LLM (free vs paid) ──")
     total_fields_possible = n * len(PRODUCT_FIELDS)
@@ -177,6 +196,18 @@ def print_report(
     for m in all_metrics:
         print(f"    {m.filename:<25} {m.category_resolution}")
 
+    # ── QA Validation ──────────────────────────────────────────────
+    print("\n── QA Validation ──")
+    qa_passed = sum(1 for m in all_metrics if m.qa_passed)
+    qa_issues_total = sum(len(m.qa_issues) for m in all_metrics)
+    print(f"  Passed (no issues):    {qa_passed}/{n}")
+    print(f"  Total issues found:    {qa_issues_total}")
+    for m in all_metrics:
+        if m.qa_passed:
+            print(f"    {m.filename:<25} passed")
+        else:
+            print(f"    {m.filename:<25} {len(m.qa_issues)} issues: {'; '.join(m.qa_issues[:3])}")
+
     # ── Output Richness ─────────────────────────────────────────────
     print("\n── Output Richness ──")
     print(f"  {'File':<25} {'Variants':>9} {'Images':>8} {'Features':>9} {'Colors':>8} {'Video':>7} {'Sale':>6}")
@@ -202,24 +233,27 @@ def print_report(
     # ── Timing ──────────────────────────────────────────────────────
     print("\n── Timing ──")
     print(f"  Wall clock (total):  {wall_clock:.2f}s")
-    print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'Total':>8}")
-    print(f"  {'-' * 69}")
+    print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'QA':>8} {'Total':>8}")
+    print(f"  {'-' * 77}")
     for m, pt in zip(all_metrics, parse_times, strict=True):
         print(
             f"  {m.filename:<25} {pt:>7.3f}s {m.hydrate_time:>8.3f}s "
-            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s {m.total_time:>7.3f}s"
+            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s "
+            f"{m.qa_time:>7.3f}s {m.total_time:>7.3f}s"
         )
 
     total_parse = sum(parse_times)
     total_hydrate = sum(m.hydrate_time for m in all_metrics)
     total_llm_time = sum(m.llm_fill_time for m in all_metrics)
     total_validate = sum(m.validate_time for m in all_metrics)
+    total_qa = sum(m.qa_time for m in all_metrics)
     sum_total = sum(m.total_time for m in all_metrics)
 
-    print(f"  {'-' * 69}")
+    print(f"  {'-' * 77}")
     print(
         f"  {'SUM':<25} {total_parse:>7.3f}s {total_hydrate:>8.3f}s "
-        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s {sum_total:>7.3f}s"
+        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s "
+        f"{total_qa:>7.3f}s {sum_total:>7.3f}s"
     )
 
     if sum_total > 0:
