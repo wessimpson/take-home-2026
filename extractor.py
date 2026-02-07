@@ -20,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 import ai
 import taxonomy
-from models import VALID_CATEGORIES, Category, Price, Product, Variant
+from models import VALID_CATEGORIES, Category, Price, Product, Variant, VariantDimension
 from parser import ParsedPage
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,7 @@ PRODUCT_FIELDS = [
     "video_url",
     "category",
     "colors",
+    "variant_dimensions",
     "variants",
 ]
 
@@ -266,17 +267,29 @@ _COMPARE_PRICE_KEY_RE = re.compile(r"(?i)(compare|original|msrp|was|fullPrice|re
 _SKIP_IMAGE_RE = re.compile(r"(?i)(favicon|logo|pixel|tracking|analytics|1x1|spacer|icon\b|\.svg|flyout)")
 _VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:mp4|webm|m3u8)", re.IGNORECASE)
 
-# Variant detection
-_VARIANT_SKU_KEYS = re.compile(r"(?i)^(sku|id|item|code|mpn)$")
-_VARIANT_GTIN_KEYS = re.compile(r"(?i)^(gtin|ean|upc|barcode|isbn)$")
-_VARIANT_SIZE_KEYS = re.compile(r"(?i)^(size|label|dimension)$")
-_VARIANT_COLOR_KEYS = re.compile(r"(?i)^(color|colour)$")
-_VARIANT_AVAIL_KEYS = re.compile(r"(?i)^(status|available|availability|stock|instock)$")
+# Variant detection — regex patterns for matching keys in arbitrary JSON structures
+_VARIANT_SKU_KEYS = re.compile(r"(?i)^(sku|id|item|code|mpn|itemNumber|productCode)$")
+_VARIANT_GTIN_KEYS = re.compile(r"(?i)^(gtin|gtin\d{0,2}|ean|upc|barcode|isbn)$")
+_VARIANT_SIZE_KEYS = re.compile(r"(?i)^(size|sizing|shoe_?size|clothing_?size|apparel_?size|label|dimension|taille)$")
+_VARIANT_COLOR_KEYS = re.compile(r"(?i)^(color|colour|colorway|shade|hue|color_?name|selectedColor|swatch)$")
+_VARIANT_AVAIL_KEYS = re.compile(r"(?i)^(status|available|availability|stock|instock|in_stock|inventoryStatus)$")
 _VARIANT_IMAGE_KEYS = re.compile(
     r"(?i)^(image|featured_image|image_url|imageUrl|img|photo|thumbnail)$"
 )
+_VARIANT_URL_KEYS = re.compile(r"(?i)^(url|href|link|product_?url|variant_?url|permalink)$")
+# Additional dimension detection for generic arrays
+_VARIANT_FIT_KEYS = re.compile(r"(?i)^(fit|cut|silhouette)$")
+_VARIANT_WIDTH_KEYS = re.compile(r"(?i)^(width|shoe_?width)$")
+_VARIANT_LENGTH_KEYS = re.compile(r"(?i)^(length|inseam|leg_?length)$")
+_VARIANT_MATERIAL_KEYS = re.compile(r"(?i)^(material|fabric|composition|textile)$")
+_VARIANT_STYLE_KEYS = re.compile(r"(?i)^(style|edition|model|version)$")
+_VARIANT_PATTERN_KEYS = re.compile(r"(?i)^(pattern|print|motif|design)$")
+_VARIANT_FLAVOR_KEYS = re.compile(r"(?i)^(flavor|flavour|scent|fragrance)$")
+_VARIANT_STORAGE_KEYS = re.compile(r"(?i)^(storage|memory|capacity|ram)$")
+_VARIANT_FINISH_KEYS = re.compile(r"(?i)^(finish|surface|coating)$")
 _VARIANT_SIGNAL_KEYS = {
     "size",
+    "sizing",
     "sku",
     "ean",
     "upc",
@@ -290,12 +303,25 @@ _VARIANT_SIGNAL_KEYS = {
     "amount",
     "color",
     "colour",
+    "colorway",
     "title",
     "name",
     "option",
     "variant",
     "option1",
     "option2",
+    "option3",
+    "fit",
+    "width",
+    "length",
+    "material",
+    "style",
+    "pattern",
+    "flavor",
+    "storage",
+    "finish",
+    "inseam",
+    "capacity",
 }
 
 
@@ -584,7 +610,7 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
     for _source_name, data in parsed.embedded_json.items():
         product_obj = _find_product_object(data)
         if product_obj:
-            _extract_fields_from_object(product_obj, fields)
+            _extract_fields_from_object(product_obj, fields, data_root=data)
 
     # 2. JSON-LD (standardized, reliable)
     for ld_block in parsed.json_ld:
@@ -697,6 +723,10 @@ def _hydrate_fields(parsed: ParsedPage) -> dict:
             )
             fields["_dom_sale_price_used"] = True
 
+    # 11. Derive variant_dimensions from variants if not already set (covers all extraction paths)
+    if fields.get("variants") and not fields.get("variant_dimensions"):
+        fields["variant_dimensions"] = _build_dimensions_from_variants(fields["variants"])
+
     return fields
 
 
@@ -806,7 +836,7 @@ def _find_product_object(data: Any, depth: int = 0) -> dict | None:
 # ----- Field Extractors from Embedded JSON -----
 
 
-def _extract_fields_from_object(obj: dict, fields: dict) -> None:
+def _extract_fields_from_object(obj: dict, fields: dict, data_root: Any = None) -> None:
     """Extract Product fields from a product-like embedded JSON object."""
     _extract_name(obj, fields)
     _extract_brand(obj, fields)
@@ -816,7 +846,7 @@ def _extract_fields_from_object(obj: dict, fields: dict) -> None:
     _extract_images_from_obj(obj, fields)
     _extract_video_from_obj(obj, fields)
     _extract_colors(obj, fields)
-    _extract_variants(obj, fields)
+    _extract_variants(obj, fields, data_root=data_root)
     _extract_category_hint(obj, fields)
 
 
@@ -1078,7 +1108,7 @@ def _find_key_recursive(data: Any, key: str, depth: int = 0) -> Any:
     return None
 
 
-def _extract_variants(obj: dict, fields: dict) -> None:
+def _extract_variants(obj: dict, fields: dict, data_root: Any = None) -> None:
     if fields.get("variants"):
         return
 
@@ -1086,26 +1116,56 @@ def _extract_variants(obj: dict, fields: dict) -> None:
     questions = obj.get("questions")
     skus_list = obj.get("skus")
     if isinstance(questions, list) and isinstance(skus_list, list) and questions and skus_list:
-        variants = _build_variants_from_questions(questions, skus_list)
+        prices_list = obj.get("prices")
+        media_list = obj.get("media") if isinstance(obj.get("media"), list) else None
+        variants = _build_variants_from_questions(questions, skus_list, prices_list, media_list)
         if variants:
             fields["variants"] = variants
+            # Build variant dimensions from questions
+            dims = _build_dimensions_from_questions(questions)
+            if dims:
+                fields["variant_dimensions"] = dims
             return
 
-    # Generic: items with name/sku/ean
+    # Generic: items with name/sku/ean (e.g., headless CMS product objects)
     items = obj.get("items")
     if isinstance(items, list) and items:
+        # Check for relatedProducts (color variants with their own items/sizes)
+        related = obj.get("relatedProducts")
+        product_sku = obj.get("productSku")
+        if isinstance(related, list) and related and product_sku:
+            # Derive base URL from seo.url (may be on a parent in the data tree)
+            base_url = None
+            seo = obj.get("seo")
+            if isinstance(seo, dict) and isinstance(seo.get("url"), str):
+                base_url = seo["url"]
+            if not base_url and data_root is not None:
+                seo_url = _find_key_recursive(data_root, "seo")
+                if isinstance(seo_url, dict) and isinstance(seo_url.get("url"), str):
+                    base_url = seo_url["url"]
+            all_variants = _build_variants_from_related_products(obj, related, product_sku, base_url)
+            if all_variants:
+                fields["variants"] = all_variants[0]
+                if all_variants[1]:
+                    fields["variant_dimensions"] = all_variants[1]
+                return
+
+        # Single-color items extraction
         variants: list[Variant] = []
+        color_name = obj.get("variantName")
         for item in items:
             if not isinstance(item, dict):
                 continue
             if not item.get("sku") and not item.get("ean"):
                 continue
-            attrs = {}
+            attrs: dict[str, str] = {}
+            if color_name and isinstance(color_name, str):
+                attrs["color"] = color_name
             name = item.get("name")
             if name:
                 attrs["size"] = str(name)
             sku = item.get("sku") or item.get("item")
-            ean = item.get("ean") or item.get("upc")
+            ean = item.get("ean") or item.get("upc") or item.get("barcode")
             img = _extract_variant_image(
                 item.get("image") or item.get("imageUrl") or item.get("featured_image")
             )
@@ -1137,6 +1197,10 @@ def _extract_variants(obj: dict, fields: dict) -> None:
         if variants:
             fields["variants"] = variants
 
+    # Derive variant_dimensions from extracted variants if not already set
+    if fields.get("variants") and not fields.get("variant_dimensions"):
+        fields["variant_dimensions"] = _build_dimensions_from_variants(fields["variants"])
+
 
 def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
     """Build Variant objects from a generic array of variant-like dicts."""
@@ -1149,16 +1213,42 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
         sku = None
         gtin = None
         image_url = None
+        v_url = None
         available = True
+        v_price = None
+        v_image_urls: list[str] = []
+
+        # Map of (regex, canonical_name) for all extractable attribute dimensions
+        dim_patterns = [
+            (_VARIANT_SIZE_KEYS, "size"),
+            (_VARIANT_COLOR_KEYS, "color"),
+            (_VARIANT_FIT_KEYS, "fit"),
+            (_VARIANT_WIDTH_KEYS, "width"),
+            (_VARIANT_LENGTH_KEYS, "length"),
+            (_VARIANT_MATERIAL_KEYS, "material"),
+            (_VARIANT_STYLE_KEYS, "style"),
+            (_VARIANT_PATTERN_KEYS, "pattern"),
+            (_VARIANT_FLAVOR_KEYS, "flavor"),
+            (_VARIANT_STORAGE_KEYS, "storage"),
+            (_VARIANT_FINISH_KEYS, "finish"),
+        ]
 
         for k, v in item.items():
-            if _VARIANT_SIZE_KEYS.match(k):
-                attrs["size"] = str(v)
-            elif _VARIANT_COLOR_KEYS.match(k):
-                if isinstance(v, str):
-                    attrs["color"] = v
-                elif isinstance(v, dict) and v.get("name"):
-                    attrs["color"] = v["name"]
+            # Check all dimension patterns
+            dim_matched = False
+            for pattern, dim_name in dim_patterns:
+                if pattern.match(k):
+                    if isinstance(v, str):
+                        attrs[dim_name] = v
+                    elif isinstance(v, dict) and v.get("name"):
+                        attrs[dim_name] = v["name"]
+                    elif isinstance(v, (int, float)):
+                        attrs[dim_name] = str(v)
+                    dim_matched = True
+                    break
+
+            if dim_matched:
+                continue
             elif _VARIANT_SKU_KEYS.match(k) and sku is None:
                 sku = str(v)
             elif _VARIANT_GTIN_KEYS.match(k):
@@ -1182,9 +1272,36 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
                     available = status not in ("OUT_OF_STOCK", "UNAVAILABLE")
             elif _VARIANT_IMAGE_KEYS.match(k) and image_url is None:
                 image_url = _extract_variant_image(v)
+            elif v_url is None and _VARIANT_URL_KEYS.match(k) and isinstance(v, str) and v.startswith(("http://", "https://", "/")):
+                v_url = v
+
+        # Shopify option1/option2/option3 pattern — positional variant attributes
+        for opt_key in ("option1", "option2", "option3"):
+            val = item.get(opt_key)
+            if val and isinstance(val, str) and val.strip():
+                # Map to a named dimension if we can infer from the options array
+                options = item.get("options", [])
+                opt_idx = int(opt_key[-1]) - 1
+                if isinstance(options, list) and opt_idx < len(options):
+                    dim_name = str(options[opt_idx]).lower().strip()
+                else:
+                    dim_name = opt_key  # fallback: "option1", "option2"
+                if dim_name not in attrs:
+                    attrs[dim_name] = val.strip()
+
+        # Per-variant price
+        if v_price is None:
+            v_price = _extract_price_recursive(item, depth=5)
+
+        # Per-variant images (merge single image extract with recursive collection)
+        if image_url:
+            v_image_urls = [image_url] + v_image_urls
+        item_images = _collect_image_urls_recursive(item, max_depth=3)
+        if item_images:
+            v_image_urls = _normalize_and_dedup_urls(v_image_urls + item_images)
 
         if not attrs:
-            name = item.get("name")
+            name = item.get("name") or item.get("title")
             if name:
                 attrs["size"] = str(name)
 
@@ -1194,7 +1311,9 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
                     attributes=attrs,
                     sku=sku,
                     gtin=gtin,
-                    image_url=image_url,
+                    price=v_price,
+                    image_urls=v_image_urls,
+                    url=v_url,
                     available=available,
                 )
             )
@@ -1202,8 +1321,13 @@ def _build_variants_from_generic_array(arr: list[dict]) -> list[Variant]:
     return variants
 
 
-def _build_variants_from_questions(questions: list, skus_list: list) -> list[Variant]:
-    """Build variants from questions/answers + SKU cross-reference."""
+def _build_variants_from_questions(
+    questions: list, skus_list: list, prices_list: list | None = None, media_list: list | None = None
+) -> list[Variant]:
+    """Build variants from questions/answers + SKU cross-reference.
+
+    Optionally follows price and media reference chains when available.
+    """
     sku_attrs: dict[str, dict[str, str]] = {}
 
     for q in questions:
@@ -1228,6 +1352,33 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
                     sku_attrs[sid_str] = {}
                 sku_attrs[sid_str][attr_name] = title
 
+    # Build price lookup from prices array (id -> Price)
+    price_lookup: dict[str, Price] = {}
+    if prices_list and isinstance(prices_list, list):
+        for p in prices_list:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id") or p.get("priceId")
+            amount = p.get("amount") or p.get("price")
+            if pid and amount is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    price_lookup[str(pid)] = Price(
+                        price=float(amount),
+                        currency=p.get("currency", "USD"),
+                        compare_at_price=float(p["compareAt"]) if p.get("compareAt") else None,
+                    )
+
+    # Build media lookup from media array (id -> image URL)
+    media_lookup: dict[str, str] = {}
+    if media_list and isinstance(media_list, list):
+        for m in media_list:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id") or m.get("mediaId")
+            src = m.get("src") or m.get("url")
+            if mid and src and isinstance(src, str):
+                media_lookup[str(mid)] = src
+
     variants: list[Variant] = []
     for sku in skus_list:
         if not isinstance(sku, dict):
@@ -1247,16 +1398,205 @@ def _build_variants_from_questions(questions: list, skus_list: list) -> list[Var
             status = str(availability.get("status", "")).upper()
             available = status not in ("OUT_OF_STOCK", "UNAVAILABLE")
 
+        # Per-variant price from reference chain
+        v_price = None
+        price_ref = sku.get("price")
+        if isinstance(price_ref, str) and price_ref in price_lookup:
+            v_price = price_lookup[price_ref]
+
+        # Per-variant images from media references
+        v_image_urls: list[str] = []
+        media_refs = sku.get("media", [])
+        if isinstance(media_refs, list):
+            for ref in media_refs:
+                ref_str = str(ref)
+                if ref_str in media_lookup:
+                    v_image_urls.append(media_lookup[ref_str])
+
+        # Merge single image_url into image_urls list
+        all_image_urls = v_image_urls
+        if image_url and image_url not in all_image_urls:
+            all_image_urls = [image_url] + all_image_urls
+
         variants.append(
             Variant(
                 attributes=attrs,
                 sku=sku_id,
-                image_url=image_url,
+                price=v_price,
+                image_urls=all_image_urls,
                 available=available,
             )
         )
 
     return variants
+
+
+def _build_variants_from_related_products(
+    main_obj: dict, related: list, product_sku: str, base_url: str | None = None
+) -> tuple[list[Variant], list[VariantDimension]] | None:
+    """Build color x size variant matrix from main product + relatedProducts.
+
+    Some headless e-commerce platforms store sibling color variants as relatedProducts
+    that share the same productSku. Each color variant has its own items (sizes),
+    prices, and media.
+    """
+    # Collect all color product objects: main + related siblings
+    color_products = [main_obj]
+    for rp in related:
+        if not isinstance(rp, dict):
+            continue
+        # Only include siblings with same productSku (not cross-sells)
+        if str(rp.get("productSku", "")) == str(product_sku):
+            color_products.append(rp)
+
+    if len(color_products) < 2:
+        return None
+
+    # Derive URL prefix from base_url (strip last slug to get locale base)
+    # e.g. "https://example.com/us/product-slug" -> "https://example.com/us/"
+    url_prefix = ""
+    if base_url:
+        last_slash = base_url.rfind("/")
+        if last_slash > len("https://x"):
+            url_prefix = base_url[: last_slash + 1]
+
+    variants: list[Variant] = []
+    all_colors: list[str] = []
+    all_sizes: list[str] = []
+
+    for cp in color_products:
+        color_name = cp.get("variantName", "")
+        if not color_name or not isinstance(color_name, str):
+            continue
+        if color_name not in all_colors:
+            all_colors.append(color_name)
+
+        # Per-color price
+        color_price = None
+        cp_price = cp.get("price")
+        if isinstance(cp_price, str):
+            # Parse "170 USD" format
+            parts = cp_price.strip().split()
+            if len(parts) >= 1:
+                with contextlib.suppress(ValueError):
+                    amount = float(parts[0])
+                    currency = parts[1] if len(parts) > 1 else "USD"
+                    color_price = Price(price=amount, currency=currency)
+        elif isinstance(cp_price, (int, float)):
+            color_price = Price(price=float(cp_price), currency="USD")
+
+        # Per-color images
+        color_image_urls: list[str] = []
+        media = cp.get("media")
+        if isinstance(media, dict):
+            # Try standard, full, or any resolution key
+            for res_key in ("standard", "full", "max"):
+                imgs = media.get(res_key)
+                if isinstance(imgs, list):
+                    color_image_urls.extend(str(u) for u in imgs if isinstance(u, str) and u.startswith("http"))
+                    break
+        media_objects = cp.get("mediaObjects")
+        if not color_image_urls and isinstance(media_objects, list):
+            for mo in media_objects:
+                if isinstance(mo, dict):
+                    sources = mo.get("sources")
+                    if isinstance(sources, dict):
+                        for src in sources.values():
+                            if isinstance(src, str) and src.startswith("http"):
+                                color_image_urls.append(src)
+                                break
+
+        # Per-color URL from URI slug
+        color_url = None
+        cp_uri = cp.get("uri")
+        if url_prefix and isinstance(cp_uri, str) and cp_uri:
+            color_url = url_prefix + cp_uri
+
+        # Per-size items within this color
+        items = cp.get("items", [])
+        if not isinstance(items, list) or not items:
+            continue
+
+        cp_available = cp.get("available", True)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            size_name = item.get("name")
+            if not size_name:
+                continue
+            size_str = str(size_name)
+            if size_str not in all_sizes:
+                all_sizes.append(size_str)
+
+            sku = item.get("sku") or item.get("item")
+            ean = item.get("ean") or item.get("upc") or item.get("barcode")
+            stock = item.get("stock")
+            available = bool(cp_available)
+            if isinstance(stock, (int, float)):
+                available = stock > 0
+            elif isinstance(stock, dict):
+                total = sum(v for v in stock.values() if isinstance(v, (int, float)))
+                available = total > 0
+
+            variants.append(
+                Variant(
+                    attributes={"color": color_name, "size": size_str},
+                    sku=str(sku) if sku else None,
+                    gtin=str(ean) if ean else None,
+                    price=color_price,
+                    image_urls=color_image_urls,
+                    url=color_url,
+                    available=available,
+                )
+            )
+
+    if not variants:
+        return None
+
+    dims: list[VariantDimension] = []
+    if all_colors:
+        dims.append(VariantDimension(name="color", values=all_colors))
+    if all_sizes:
+        dims.append(VariantDimension(name="size", values=all_sizes))
+
+    return variants, dims
+
+
+def _build_dimensions_from_questions(questions: list) -> list[VariantDimension]:
+    """Build VariantDimension list from the questions/answers pattern."""
+    from models import _ATTR_KEY_ALIASES
+
+    dims: list[VariantDimension] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        q_type = str(q.get("type", "")).lower()
+        if not q_type:
+            continue
+        # Apply the same normalization as Variant.attributes
+        q_type = _ATTR_KEY_ALIASES.get(q_type, q_type)
+        answers = q.get("answers", [])
+        if not isinstance(answers, list):
+            continue
+        values = []
+        for a in answers:
+            if isinstance(a, dict) and a.get("title"):
+                values.append(str(a["title"]))
+        if values:
+            dims.append(VariantDimension(name=q_type, values=values))
+    return dims
+
+
+def _build_dimensions_from_variants(variants: list[Variant]) -> list[VariantDimension]:
+    """Derive VariantDimension list from existing variants' attributes."""
+    dim_values: dict[str, list[str]] = {}
+    for v in variants:
+        for key, val in v.attributes.items():
+            if key not in dim_values:
+                dim_values[key] = []
+            if val not in dim_values[key]:
+                dim_values[key].append(val)
+    return [VariantDimension(name=k, values=v) for k, v in dim_values.items()]
 
 
 def _extract_category_hint(obj: dict, fields: dict) -> None:
@@ -1355,29 +1695,63 @@ def _extract_fields_from_json_ld(ld: dict, fields: dict) -> None:
                 if not isinstance(v, dict):
                     continue
                 attrs: dict[str, str] = {}
-                if v.get("size"):
-                    attrs["size"] = str(v["size"])
-                if v.get("color"):
-                    attrs["color"] = str(v["color"])
+                # Schema.org standard properties + common extensions
+                ld_dim_keys = {
+                    "size": "size",
+                    "color": "color",
+                    "material": "material",
+                    "pattern": "pattern",
+                    "width": "width",
+                    "depth": "depth",
+                    "height": "height",
+                    "weight": "weight",
+                    "capacity": "storage",
+                    "model": "style",
+                }
+                for ld_key, dim_name in ld_dim_keys.items():
+                    val = v.get(ld_key)
+                    if val:
+                        attrs[dim_name] = str(val)
                 if not attrs:
                     continue
                 v_price = None
+                v_url = None
+                v_available = True
                 v_offers = v.get("offers")
                 if isinstance(v_offers, list) and v_offers:
                     v_offers = v_offers[0]
-                if isinstance(v_offers, dict) and "price" in v_offers:
-                    v_price = Price(
-                        price=float(v_offers["price"]),
-                        currency=v_offers.get("priceCurrency", "USD"),
-                    )
-                v_image = _extract_variant_image(v.get("image"))
+                if isinstance(v_offers, dict):
+                    if "price" in v_offers:
+                        v_price = Price(
+                            price=float(v_offers["price"]),
+                            currency=v_offers.get("priceCurrency", "USD"),
+                        )
+                    if v_offers.get("url"):
+                        v_url = str(v_offers["url"])
+                    avail = v_offers.get("availability", "")
+                    if isinstance(avail, str) and "OutOfStock" in avail:
+                        v_available = False
+                # Fallback URL from @id (often has per-variant fragment like #size-5)
+                if not v_url and v.get("@id") and isinstance(v.get("@id"), str):
+                    v_url = v["@id"]
+                # Per-variant image
+                v_image_urls: list[str] = []
+                v_image = v.get("image")
+                if isinstance(v_image, str) and v_image.startswith("http"):
+                    v_image_urls = [v_image]
+                elif isinstance(v_image, list):
+                    v_image_urls = [str(i) for i in v_image if isinstance(i, str) and i.startswith("http")]
+                # GTIN: check gtin, gtin13, gtin14, gtin12
+                v_gtin = v.get("gtin") or v.get("gtin13") or v.get("gtin14") or v.get("gtin12")
                 variants.append(
                     Variant(
                         attributes=attrs,
-                        sku=v.get("mpn"),
-                        gtin=v.get("gtin"),
+                        sku=v.get("mpn") or v.get("sku"),
+                        gtin=str(v_gtin) if v_gtin else None,
                         price=v_price,
-                        image_url=v_image,
+                        image_urls=v_image_urls,
+                        url=v_url,
+                        available=v_available,
                     )
                 )
             if variants:
@@ -1615,6 +1989,12 @@ async def _validate_product(fields: dict, parsed: ParsedPage) -> tuple[Product, 
     if "variants" in fields:
         fields["variants"] = [v.model_dump() if isinstance(v, Variant) else v for v in fields["variants"]]
 
+    # Ensure variant_dimensions are dicts
+    if "variant_dimensions" in fields:
+        fields["variant_dimensions"] = [
+            d.model_dump() if isinstance(d, VariantDimension) else d for d in fields["variant_dimensions"]
+        ]
+
     # Save and remove internal hint fields before validation
     saved_hints = fields.pop("_category_hints", [])
 
@@ -1678,7 +2058,7 @@ async def _retry_category(fields: dict, parsed: ParsedPage) -> str | None:
 def _collect_taxonomy_signals(fields: dict, parsed: ParsedPage) -> list[str]:
     """Collect product text signals for taxonomy classification.
 
-    Excludes brand (brand names can cause false matches in taxonomy).
+    Excludes brand (brand names cause false matches in taxonomy).
     Skips last breadcrumb segment (usually the product name, not a category).
     """
     signals = []
@@ -1700,6 +2080,7 @@ def _set_defaults(fields: dict) -> None:
     fields.setdefault("key_features", [])
     fields.setdefault("colors", [])
     fields.setdefault("variants", [])
+    fields.setdefault("variant_dimensions", [])
     fields.setdefault("video_url", None)
     fields.setdefault("image_urls", [])
     fields.setdefault("description", "")

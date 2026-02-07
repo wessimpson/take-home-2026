@@ -17,3 +17,6 @@ analysis/
 
 # Playwright MCP
 .playwright-mcp/
+
+# Take-home prompt (reference only, not for submission)
+PROMPT.md
