@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 import ai
 import taxonomy
-from models import VALID_CATEGORIES, Category, Price, Product, Variant, VariantDimension
+from models import VALID_CATEGORIES, Category, Price, Product, Variant, VariantDimension, VerificationResult
 from parser import ParsedPage
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,14 @@ class ExtractionMetrics:
     num_colors: int = 0
     has_video: bool = False
     has_sale_price: bool = False
+    # Verification (Stage D+E)
+    qa_time: float = 0.0
+    verify_time: float = 0.0
+    verify_passed: bool = True
+    verify_images_removed: int = 0
+    verify_variants_removed: int = 0
+    verify_fields_corrected: list[str] = field(default_factory=list)
+    verify_issues: list[str] = field(default_factory=list)
 
 
 # ===== LLM Response Schema =====
@@ -171,7 +179,32 @@ async def extract_product(parsed: ParsedPage, filename: str) -> tuple[Product, E
     else:
         metrics.category_resolution = "failed"
 
-    # Output richness
+    # Stage D: Programmatic QA (free)
+    t0 = time.monotonic()
+    product = _programmatic_qa(product)
+    metrics.qa_time = time.monotonic() - t0
+
+    # Stage E: LLM Verification (1 call)
+    t0 = time.monotonic()
+    num_images_before = len(product.image_urls)
+    num_variants_before = len(product.variants)
+    product, verify_result = await _verify_product(product, parsed)
+    metrics.verify_time = time.monotonic() - t0
+    metrics.llm_calls += 1
+    metrics.verify_passed = verify_result.is_coherent
+    metrics.verify_images_removed = num_images_before - len(product.image_urls)
+    metrics.verify_variants_removed = num_variants_before - len(product.variants)
+    if verify_result.corrected_name:
+        metrics.verify_fields_corrected.append("name")
+    if verify_result.corrected_description:
+        metrics.verify_fields_corrected.append("description")
+    if verify_result.corrected_key_features is not None:
+        metrics.verify_fields_corrected.append("key_features")
+    if not verify_result.category_correct and verify_result.suggested_category:
+        metrics.verify_fields_corrected.append("category")
+    metrics.verify_issues = verify_result.issues
+
+    # Output richness (measured after all stages)
     metrics.num_variants = len(product.variants)
     metrics.num_images = len(product.image_urls)
     metrics.num_features = len(product.key_features)
@@ -1578,7 +1611,15 @@ def _build_llm_context(fields: dict, parsed: ParsedPage, fill_fields: list[str])
 async def _call_llm_for_gaps(context: str, fill_fields: list[str], fields: dict, parsed: ParsedPage) -> LLMGapFill:
     """Call LLM to fill missing product fields."""
     system = (
-        "You are a product data extraction assistant. Extract the requested fields from the product context provided. "
+        "You are a product data specialist. You will be given partial product information "
+        "extracted from an e-commerce page. Fill ONLY the requested missing fields.\n\n"
+        "Rules:\n"
+        "- description: Write a factual 1-3 sentence product description. No marketing fluff.\n"
+        "- key_features: List concrete, specific product attributes (material, dimensions, "
+        "technology, compatibility). Not vague benefits like 'great quality'.\n"
+        "- colors: List only color names available for purchase. Not materials or patterns.\n"
+        "- price/currency: Extract from context. Use USD if currency is ambiguous.\n"
+        "- Return null for any field you cannot confidently determine."
     )
 
     # If category is needed, use taxonomy tree to narrow candidates
@@ -1767,3 +1808,243 @@ def _set_defaults(fields: dict) -> None:
     fields.setdefault("video_url", None)
     fields.setdefault("image_urls", [])
     fields.setdefault("description", "")
+
+
+# =====================================================================
+# Stage D: Programmatic QA (free, deterministic)
+# =====================================================================
+
+_SUSPECT_IMAGE_RE = re.compile(
+    r"(?i)(related[-_]?product|recommendation|cross[-_]?sell|upsell|also[-_]?like|"
+    r"you[-_]?may|frequently[-_]?bought|sponsored|placeholder|coming[-_]?soon)"
+)
+
+
+def _programmatic_qa(product: Product) -> Product:
+    """Run code-only quality checks on an assembled Product. Returns a cleaned copy."""
+    data = product.model_dump()
+
+    # 1. Image dedup: remove near-duplicates (same path, different query params)
+    if data["image_urls"]:
+        from urllib.parse import urlparse
+
+        seen_paths: set[str] = set()
+        deduped: list[str] = []
+        for url in data["image_urls"]:
+            path = urlparse(url).path
+            if path not in seen_paths:
+                seen_paths.add(path)
+                deduped.append(url)
+        data["image_urls"] = deduped
+
+    # 2. Image URL sanity: remove URLs matching suspect patterns
+    if data["image_urls"]:
+        data["image_urls"] = [
+            url for url in data["image_urls"] if not _SUSPECT_IMAGE_RE.search(url)
+        ]
+
+    # 3. Variant dedup: remove variants with identical attributes
+    if data["variants"]:
+        seen_attrs: set[str] = set()
+        unique_variants: list[dict] = []
+        for v in data["variants"]:
+            key = str(sorted(v["attributes"].items()))
+            if key not in seen_attrs:
+                seen_attrs.add(key)
+                unique_variants.append(v)
+        data["variants"] = unique_variants
+
+    # 4. Variant dimension consistency: remove variants missing required dimensions
+    if data["variants"] and data["variant_dimensions"]:
+        expected_dims = {d["name"] for d in data["variant_dimensions"]}
+        if len(expected_dims) >= 2:
+            data["variants"] = [
+                v for v in data["variants"]
+                if len(set(v["attributes"].keys()) & expected_dims) >= len(expected_dims)
+            ]
+
+    # 5. Feature dedup (case-insensitive)
+    if data["key_features"]:
+        seen_lower: set[str] = set()
+        unique_features: list[str] = []
+        for f in data["key_features"]:
+            lower = f.strip().lower()
+            if lower and lower not in seen_lower:
+                seen_lower.add(lower)
+                unique_features.append(f.strip())
+        data["key_features"] = unique_features
+
+    # 6. Description HTML cleanup
+    if data["description"]:
+        data["description"] = _clean_html(data["description"])
+
+    # 7. Price sanity (log warning only, don't modify)
+    price = data.get("price", {})
+    if isinstance(price, dict) and price.get("price"):
+        if price["price"] <= 0:
+            logger.warning(f"  QA: Price is ${price['price']} (zero or negative)")
+        elif price["price"] > 100_000:
+            logger.warning(f"  QA: Price is ${price['price']} (unusually high)")
+
+    # Rebuild variant_dimensions from surviving variants
+    if data["variants"]:
+        dim_values: dict[str, list[str]] = {}
+        for v in data["variants"]:
+            for key, val in v["attributes"].items():
+                if key not in dim_values:
+                    dim_values[key] = []
+                if val not in dim_values[key]:
+                    dim_values[key].append(val)
+        data["variant_dimensions"] = [
+            {"name": k, "values": v} for k, v in dim_values.items()
+        ]
+
+    return Product(**data)
+
+
+# =====================================================================
+# Stage E: LLM Verification
+# =====================================================================
+
+VERIFY_SYSTEM = (
+    "You are a product data quality auditor for an e-commerce catalog. "
+    "You will receive a product data record assembled by an automated pipeline. "
+    "Your job is to catch errors that would confuse a shopper or make the listing "
+    "look low-quality.\n\n"
+    "CHECK THESE SPECIFIC THINGS:\n\n"
+    "1. IMAGES: Look at the image URL paths. Flag (by index) any that clearly belong "
+    "to a DIFFERENT product (different product name/ID in the URL path). Keep all "
+    "legitimate shots (front, back, detail, lifestyle) of the correct product.\n\n"
+    "2. VARIANTS: Check that variant attributes make sense for this product type. "
+    "Flag (by index) any variants that appear to be from a different product or have "
+    "nonsensical attributes. Sizes on shoes = good. Flavors on a lamp = bad.\n\n"
+    "3. DESCRIPTION: If the description doesn't actually describe THIS product "
+    "(wrong product name, describes a different item), provide a corrected version. "
+    "Otherwise leave corrected_description as null.\n\n"
+    "4. CATEGORY: Verify the Google Product Taxonomy category fits. If wrong, "
+    "suggest the correct one from the provided candidates. Otherwise set "
+    "category_correct=true.\n\n"
+    "5. NAME: If the product name contains junk (SKU codes, HTML, excessive branding), "
+    "provide a cleaned version. Otherwise leave corrected_name as null.\n\n"
+    "6. FEATURES: If features contain generic marketing copy ('great quality', "
+    "'best in class') rather than specific product attributes, provide a corrected "
+    "list with only concrete features. Otherwise leave null.\n\n"
+    "IMPORTANT: Only flag real problems. If the data looks good, set is_coherent=true "
+    "and leave all correction fields as null. Do not invent problems."
+)
+
+
+def _build_verify_context(product: Product, parsed: ParsedPage) -> str:
+    """Build a compact product summary for verification. Minimizes tokens."""
+    from urllib.parse import urlparse
+
+    parts = [
+        f"Product: {product.name}",
+        f"Brand: {product.brand}",
+        f"Price: {product.price.price} {product.price.currency}",
+        f"Category: {product.category.name}",
+        f"Description: {product.description[:500]}",
+    ]
+
+    if product.key_features:
+        parts.append(f"Features: {'; '.join(product.key_features[:8])}")
+
+    if product.colors:
+        parts.append(f"Colors: {', '.join(product.colors)}")
+
+    # Images: send just the URL paths (strip domain/CDN to save tokens)
+    if product.image_urls:
+        paths = []
+        for i, url in enumerate(product.image_urls[:20]):
+            path = urlparse(url).path
+            paths.append(f"  [{i}] {path}")
+        parts.append(f"Images ({len(product.image_urls)}):\n" + "\n".join(paths))
+
+    # Variants: send a summary, not the full list
+    if product.variants:
+        dims = ", ".join(d.name for d in product.variant_dimensions)
+        parts.append(f"Variants: {len(product.variants)} ({dims})")
+        for i, v in enumerate(product.variants[:5]):
+            attrs = ", ".join(f"{k}={val}" for k, val in v.attributes.items())
+            parts.append(f"  [{i}] {attrs}")
+        if len(product.variants) > 5:
+            parts.append(f"  ... and {len(product.variants) - 5} more")
+
+    # Include taxonomy candidates for category verification
+    signals = []
+    if product.name:
+        signals.append(product.name)
+    if product.description:
+        signals.append(product.description[:200])
+    if parsed.breadcrumbs:
+        for bc in parsed.breadcrumbs[:-1]:
+            signals.append(bc)
+    if signals:
+        _, candidates = taxonomy.classify(signals, top_n=5)
+        if candidates:
+            parts.append(f"Category alternatives: {'; '.join(candidates[:5])}")
+
+    return "\n".join(parts)
+
+
+async def _verify_product(
+    product: Product, parsed: ParsedPage
+) -> tuple[Product, VerificationResult]:
+    """Run LLM verification on an assembled product. Returns corrected product and result."""
+    context = _build_verify_context(product, parsed)
+
+    result = await ai.responses(
+        model=LLM_MODEL,
+        input=[
+            {"role": "system", "content": VERIFY_SYSTEM},
+            {"role": "user", "content": f"Verify this product data:\n\n{context}"},
+        ],
+        text_format=VerificationResult,
+    )
+
+    if not result.is_coherent:
+        product = _apply_verification(product, result)
+
+    return product, result
+
+
+def _apply_verification(product: Product, result: VerificationResult) -> Product:
+    """Apply LLM verification corrections to the product."""
+    data = product.model_dump()
+
+    # Remove suspect images (reverse sort to preserve indices)
+    if result.suspect_image_indices:
+        for idx in sorted(set(result.suspect_image_indices), reverse=True):
+            if 0 <= idx < len(data["image_urls"]):
+                data["image_urls"].pop(idx)
+
+    # Remove suspect variants
+    if result.suspect_variant_indices:
+        for idx in sorted(set(result.suspect_variant_indices), reverse=True):
+            if 0 <= idx < len(data["variants"]):
+                data["variants"].pop(idx)
+
+    # Apply field corrections
+    if result.corrected_name:
+        data["name"] = result.corrected_name
+    if result.corrected_description:
+        data["description"] = result.corrected_description
+    if result.corrected_key_features is not None:
+        data["key_features"] = result.corrected_key_features
+    if not result.category_correct and result.suggested_category and result.suggested_category in VALID_CATEGORIES:
+        data["category"]["name"] = result.suggested_category
+
+    # Rebuild variant_dimensions from surviving variants
+    if data["variants"]:
+        dim_values: dict[str, list[str]] = {}
+        for v in data["variants"]:
+            for key, val in v["attributes"].items():
+                if key not in dim_values:
+                    dim_values[key] = []
+                if val not in dim_values[key]:
+                    dim_values[key].append(val)
+        data["variant_dimensions"] = [
+            {"name": k, "values": v} for k, v in dim_values.items()
+        ]
+
+    return Product(**data)

@@ -142,3 +142,28 @@ class Product(BaseModel):
     colors: list[str]
     variant_dimensions: list[VariantDimension] = []
     variants: list[Variant]
+
+
+class VerificationResult(BaseModel):
+    """LLM verification of assembled product data quality."""
+
+    is_coherent: bool  # True if product data looks correct as-is
+
+    # Category verification
+    category_correct: bool
+    suggested_category: str | None = None  # only if category_correct is False
+
+    # Image issues (0-based indices of images to remove)
+    suspect_image_indices: list[int] = []
+
+    # Variant issues
+    variants_coherent: bool
+    suspect_variant_indices: list[int] = []  # 0-based indices of variants to remove
+
+    # Field corrections (null = field is fine)
+    corrected_name: str | None = None
+    corrected_description: str | None = None
+    corrected_key_features: list[str] | None = None
+
+    # Explanation of any issues found
+    issues: list[str] = []

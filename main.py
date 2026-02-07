@@ -177,6 +177,39 @@ def print_report(
     for m in all_metrics:
         print(f"    {m.filename:<25} {m.category_resolution}")
 
+    # ── Verification ───────────────────────────────────────────────
+    print("\n── Verification ──")
+    verify_passed = sum(1 for m in all_metrics if m.verify_passed)
+    total_imgs_removed = sum(m.verify_images_removed for m in all_metrics)
+    total_vars_removed = sum(m.verify_variants_removed for m in all_metrics)
+    all_corrected = []
+    for m in all_metrics:
+        all_corrected.extend(m.verify_fields_corrected)
+    print(f"  Products passing verification:  {verify_passed}/{n}")
+    print(f"  Images removed:    {total_imgs_removed} across all products")
+    print(f"  Variants removed:  {total_vars_removed}")
+    if all_corrected:
+        from collections import Counter
+
+        corr_counts = Counter(all_corrected)
+        corr_str = ", ".join(f"{f} x{c}" for f, c in corr_counts.items())
+        print(f"  Fields corrected:  {len(all_corrected)} ({corr_str})")
+    else:
+        print("  Fields corrected:  0")
+    print()
+    for m in all_metrics:
+        status = "PASSED" if m.verify_passed else "CORRECTED"
+        details = ""
+        if m.verify_images_removed:
+            details += f" {m.verify_images_removed} img removed"
+        if m.verify_variants_removed:
+            details += f" {m.verify_variants_removed} var removed"
+        if m.verify_fields_corrected:
+            details += f" fields: {', '.join(m.verify_fields_corrected)}"
+        if m.verify_issues:
+            details += f" [{'; '.join(m.verify_issues[:2])}]"
+        print(f"    {m.filename:<25} {status}{details}")
+
     # ── Output Richness ─────────────────────────────────────────────
     print("\n── Output Richness ──")
     print(f"  {'File':<25} {'Variants':>9} {'Images':>8} {'Features':>9} {'Colors':>8} {'Video':>7} {'Sale':>6}")
@@ -202,31 +235,38 @@ def print_report(
     # ── Timing ──────────────────────────────────────────────────────
     print("\n── Timing ──")
     print(f"  Wall clock (total):  {wall_clock:.2f}s")
-    print(f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} {'Validate':>10} {'Total':>8}")
-    print(f"  {'-' * 69}")
+    print(
+        f"  {'File':<25} {'Parse':>8} {'Hydrate':>9} {'LLM':>8} "
+        f"{'Validate':>10} {'QA':>6} {'Verify':>8} {'Total':>8}"
+    )
+    print(f"  {'-' * 83}")
     for m, pt in zip(all_metrics, parse_times, strict=True):
         print(
             f"  {m.filename:<25} {pt:>7.3f}s {m.hydrate_time:>8.3f}s "
-            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s {m.total_time:>7.3f}s"
+            f"{m.llm_fill_time:>7.3f}s {m.validate_time:>9.3f}s "
+            f"{m.qa_time:>5.3f}s {m.verify_time:>7.3f}s {m.total_time:>7.3f}s"
         )
 
     total_parse = sum(parse_times)
     total_hydrate = sum(m.hydrate_time for m in all_metrics)
     total_llm_time = sum(m.llm_fill_time for m in all_metrics)
     total_validate = sum(m.validate_time for m in all_metrics)
+    total_qa = sum(m.qa_time for m in all_metrics)
+    total_verify = sum(m.verify_time for m in all_metrics)
     sum_total = sum(m.total_time for m in all_metrics)
 
-    print(f"  {'-' * 69}")
+    print(f"  {'-' * 83}")
     print(
         f"  {'SUM':<25} {total_parse:>7.3f}s {total_hydrate:>8.3f}s "
-        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s {sum_total:>7.3f}s"
+        f"{total_llm_time:>7.3f}s {total_validate:>9.3f}s "
+        f"{total_qa:>5.3f}s {total_verify:>7.3f}s {sum_total:>7.3f}s"
     )
 
     if sum_total > 0:
-        pct_free = (total_parse + total_hydrate) / sum_total * 100
-        pct_llm = total_llm_time / sum_total * 100
-        print(f"\n  Time in free stages (parse+hydrate): {pct_free:.1f}%")
-        print(f"  Time in LLM stages (fill+retry):     {pct_llm:.1f}%")
+        pct_free = (total_parse + total_hydrate + total_qa) / sum_total * 100
+        pct_llm = (total_llm_time + total_verify) / sum_total * 100
+        print(f"\n  Time in free stages (parse+hydrate+QA): {pct_free:.1f}%")
+        print(f"  Time in LLM stages (fill+verify):       {pct_llm:.1f}%")
 
     # ── Scale Projections ───────────────────────────────────────────
     print("\n── Scale Projections ──")
